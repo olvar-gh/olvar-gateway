@@ -13,6 +13,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from typing import Any, Final, Protocol
 
 import httpx
@@ -30,7 +31,13 @@ from .models import (
     to_row,
 )
 from .mqtt_client import MessageHandler, MqttClient
-from .uploader import SupabaseWriter, Uploader, UploadResult
+from .uploader import (
+    DEVICES_PATH,
+    MERGE_DUPLICATES,
+    SupabaseWriter,
+    Uploader,
+    UploadResult,
+)
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +54,38 @@ _DEVICE_ID_RE: Final = re.compile(DEVICE_ID_PATTERN)
 class Intake(Protocol):
     def start(self) -> None: ...
     def stop(self) -> None: ...
+
+
+class GatewayWriter(SupabaseWriter):
+    def upsert_device_status(
+        self, device_id: str, status: str, changed_at: datetime | None
+    ) -> UploadResult:
+        """Status with the time it was observed, independent of last_seen_at.
+
+        `upsert_device(status=...)` dates the change with last_seen_at or the send time, which is
+        wrong for an `offline` event delivered after a Supabase outage. A null changed_at means
+        the Pi clock was not trustworthy when the event arrived.
+        """
+        body = {
+            "id": device_id,
+            "status": status,
+            "status_changed_at": changed_at.isoformat() if changed_at else None,
+        }
+        return self._post(DEVICES_PATH, {"on_conflict": "id"}, MERGE_DUPLICATES, body)
+
+
+def _merge(older: dict[str, Any], newer: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(older)
+    if "status" in newer:
+        merged["status"] = newer["status"]
+        merged["status_changed_at"] = newer["status_changed_at"]
+    if "fw" in newer:
+        merged["fw"] = newer["fw"]
+    if "last_seen_at" in newer:
+        merged["last_seen_at"] = max(
+            newer["last_seen_at"], older.get("last_seen_at", newer["last_seen_at"])
+        )
+    return merged
 
 
 class DeviceFirstWriter:
@@ -92,7 +131,7 @@ class Service:
         self,
         *,
         outbox: Outbox,
-        writer: SupabaseWriter,
+        writer: GatewayWriter,
         clock: Clock,
         gateway_id: str,
         connect_mqtt: Callable[[MessageHandler], Intake] | None = None,
@@ -173,16 +212,19 @@ class Service:
             self._invalid(device_id, "invalid_status", status[:40])
             return
         stamp = self._clock.now()
-        seen = stamp.wall if status == "online" and stamp.synced else None
+        observed = stamp.wall if stamp.synced else None
         self.counters[f"status.{status}"] += 1
         log.info("device %s is %s", device_id, status, extra={"device_id": device_id})
-        self._touch(device_id, status=status, last_seen_at=seen)
+        fields: dict[str, Any] = {"status": status, "status_changed_at": observed}
+        if status == "online" and observed is not None:
+            fields["last_seen_at"] = observed
+        self._touch(device_id, **fields)
         self._wake.set()
 
     def _touch(self, device_id: str, **fields: Any) -> None:
+        fields = {k: v for k, v in fields.items() if v is not None or k == "status_changed_at"}
         with self._pending_lock:
-            pending = self._pending.setdefault(device_id, {})
-            pending.update({k: v for k, v in fields.items() if v is not None})
+            self._pending[device_id] = _merge(self._pending.get(device_id, {}), fields)
 
     def _invalid(self, device_id: str, reason: str, detail: str, *, drop: bool = True) -> None:
         if drop:
@@ -218,24 +260,51 @@ class Service:
         until_heartbeat = self._maybe_heartbeat()
         if self._mono() >= self._upload_due:
             self._flush_devices()
-            self._upload_due = self._mono() + self._uploader.step()
+            delay = self._uploader.step()
+            self._upload_due = self._mono() + delay
         return max(0.0, min(self._upload_due - self._mono(), until_heartbeat))
 
     def _flush_devices(self, deadline: float | None = None) -> None:
         with self._pending_lock:
             pending, self._pending = self._pending, {}
         for device_id, fields in pending.items():
-            if deadline is not None and self._mono() >= deadline:
-                result = None
-            else:
-                result = self._writer.upsert_device(device_id, **fields)
-            if result is None or result.outcome == "retryable":
+            unsent = self._send_device(device_id, fields, deadline)
+            if unsent:
                 with self._pending_lock:
-                    self._pending[device_id] = {**fields, **self._pending.get(device_id, {})}
+                    self._pending[device_id] = _merge(unsent, self._pending.get(device_id, {}))
+
+    def _send_device(
+        self, device_id: str, fields: dict[str, Any], deadline: float | None
+    ) -> dict[str, Any]:
+        """Status and last-seen go as separate requests so neither dates the other.
+        Returns the fields still to send."""
+        parts: list[tuple[dict[str, Any], Callable[[], UploadResult]]] = []
+        if "status" in fields:
+            status = {k: fields[k] for k in ("status", "status_changed_at")}
+            parts.append(
+                (
+                    status,
+                    lambda: self._writer.upsert_device_status(
+                        device_id, status["status"], status["status_changed_at"]
+                    ),
+                )
+            )
+        seen = {k: fields[k] for k in ("fw", "last_seen_at") if k in fields}
+        if seen:
+            parts.append((seen, lambda: self._writer.upsert_device(device_id, **seen)))
+        unsent: dict[str, Any] = {}
+        for part, send in parts:
+            if deadline is not None and self._mono() >= deadline:
+                unsent.update(part)
+                continue
+            result = send()
+            if result.outcome == "retryable":
+                unsent.update(part)
             elif result.ok:
                 self._readings.confirm(device_id)
             else:
                 log.error("device %s update rejected: %s", device_id, result.describe())
+        return unsent
 
     def _maybe_heartbeat(self) -> float:
         now = self._mono()
@@ -283,15 +352,27 @@ class Service:
         log.info("gateway %s started", self._gateway_id, extra={"version": __version__})
 
     def stop(self, flush_timeout: float = FLUSH_TIMEOUT_S) -> None:
-        """Stop intake, deliver what can be delivered within `flush_timeout`, close the outbox."""
-        if self._mqtt is not None:
-            self._mqtt.stop()
+        """Stop intake, deliver what can be delivered within `flush_timeout`, close the outbox.
+
+        One deadline covers waiting for an in-flight delivery round and the final drain. If a
+        thread still uses the outbox at the deadline it is left open: every committed row is
+        already durable, and the process is about to exit.
+        """
+        deadline = self._mono() + flush_timeout
         self._stopping.set()
         self._wake.set()
+        if self._mqtt is not None:
+            self._mqtt.stop()
+        finished = True
         if self._thread is not None:
-            self._thread.join()
-        if self.flush(flush_timeout):
+            self._thread.join(max(0.0, deadline - self._mono()))
+            if self._thread.is_alive():
+                log.error("delivery still waiting on Supabase at shutdown; rows stay queued")
+                finished = False
+        if finished and self.flush(max(0.0, deadline - self._mono())):
             self._outbox.close()
+        else:
+            self._last_depth = self._outbox.depth()
         log.info("gateway stopped", extra={"queue_depth_at_stop": self._last_depth})
 
     def flush(self, timeout: float) -> bool:
@@ -330,7 +411,7 @@ def build(config: Config) -> Service:
     clock = Clock()
     outbox = Outbox(config.outbox_path, config.outbox_max_rows)
     client = httpx.Client(timeout=HTTP_TIMEOUT_S)
-    writer = SupabaseWriter(config.supabase_url, config.supabase_secret_key, client)
+    writer = GatewayWriter(config.supabase_url, config.supabase_secret_key, client)
 
     def connect_mqtt(handler: MessageHandler) -> MqttClient:
         return MqttClient(

@@ -7,11 +7,12 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -23,12 +24,11 @@ from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 
 from olvar_gateway import __main__ as cli
-from olvar_gateway import config, log
+from olvar_gateway import config, log, mqtt_client
 from olvar_gateway.buffer import Outbox
 from olvar_gateway.clock import Clock
 from olvar_gateway.mqtt_client import CLIENT_ID, MqttClient
-from olvar_gateway.service import HEARTBEAT_S, Service
-from olvar_gateway.uploader import SupabaseWriter
+from olvar_gateway.service import HEARTBEAT_S, GatewayWriter, Service
 
 URL = "http://supabase.test"
 KEY = "sb_secret_test_key_value"
@@ -133,12 +133,15 @@ class FakePostgrest:
         self.devices: set[str] | None = None
         self.clock: FakeTime | None = None
         self.delay_s = 0.0
+        self.advance_s = 0.0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         self.attempts.append((self.clock.now if self.clock else 0.0, path))
         if self.delay_s:
             time.sleep(self.delay_s)
+        if self.clock and self.advance_s:
+            self.clock.now += self.advance_s
         if self.status >= 300 or path in self.down_paths:
             return httpx.Response(self.status if self.status >= 300 else 503, json={})
         body = json.loads(request.content)
@@ -188,13 +191,20 @@ def sync_flag(tmp_path):
 
 
 @pytest.fixture
-def make_service(tmp_path, server, fake_time, sync_flag):
+def wall():
+    return {"now": T0}
+
+
+@pytest.fixture
+def make_service(tmp_path, server, fake_time, sync_flag, wall):
     made = []
 
     def make(**kwargs) -> Service:
-        clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
+        clock = Clock(
+            sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: wall["now"], mono_ns=lambda: 0
+        )
         outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
-        writer = SupabaseWriter(
+        writer = GatewayWriter(
             URL, KEY, httpx.Client(transport=httpx.MockTransport(server)), now=lambda: T0
         )
         service = Service(
@@ -282,16 +292,65 @@ def test_out_of_range_is_counted_and_kept(make_service):
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
-        (b"online", {"status": "online", "last_seen_at": T0.isoformat()}),
-        (b"offline", {"status": "offline"}),
+        (
+            b"online",
+            [
+                {"id": DEVICE, "status": "online", "status_changed_at": T0.isoformat()},
+                {"id": DEVICE, "last_seen_at": T0.isoformat()},
+            ],
+        ),
+        (b"offline", [{"id": DEVICE, "status": "offline", "status_changed_at": T0.isoformat()}]),
     ],
 )
 def test_status_reaches_devices(make_service, server, payload, expected):
     service = make_service()
     service.handle_message(STATUS_TOPIC, payload, retained=True)
     service.tick()
-    [device] = server.bodies("/rest/v1/devices")
-    assert device == {"id": DEVICE, **expected, "status_changed_at": T0.isoformat()}
+    assert server.bodies("/rest/v1/devices") == expected
+
+
+def test_status_from_unsynced_clock_has_no_change_time(make_service, server, sync_flag):
+    sync_flag.unlink()
+    service = make_service()
+    service.handle_message(STATUS_TOPIC, b"online")
+    service.tick()
+    assert server.bodies("/rest/v1/devices") == [
+        {"id": DEVICE, "status": "online", "status_changed_at": None}
+    ]
+
+
+def test_coalesced_offline_keeps_its_own_change_time(make_service, server, fake_time, wall):
+    server.down_paths = {"/rest/v1/devices"}
+    service = make_service()
+    service.handle_message(STATUS_TOPIC, b"online")
+    wall["now"] = T0 + timedelta(minutes=1)
+    service.handle_message(STATUS_TOPIC, b"offline")
+    fake_time.now += service.tick()
+    wall["now"] = T0 + timedelta(minutes=30)
+    server.down_paths = set()
+    fake_time.now += 60
+    service.tick()
+    assert server.bodies("/rest/v1/devices") == [
+        {
+            "id": DEVICE,
+            "status": "offline",
+            "status_changed_at": (T0 + timedelta(minutes=1)).isoformat(),
+        },
+        {"id": DEVICE, "last_seen_at": T0.isoformat()},
+    ]
+
+
+def test_last_seen_never_moves_backwards_when_coalescing(make_service, server, wall):
+    service = make_service()
+    wall["now"] = T0 + timedelta(minutes=5)
+    service.handle_message(TOPIC, telemetry(1))
+    wall["now"] = T0
+    service.handle_message(STATUS_TOPIC, b"online")
+    service._flush_devices()
+    seen = [b for b in server.bodies("/rest/v1/devices") if "last_seen_at" in b]
+    assert seen == [
+        {"id": DEVICE, "fw": "0.1.0", "last_seen_at": (T0 + timedelta(minutes=5)).isoformat()}
+    ]
 
 
 @pytest.mark.parametrize(
@@ -325,9 +384,10 @@ def test_device_update_is_retried_after_failure(make_service, server, fake_time)
     service.handle_message(TOPIC, telemetry(1))
     server.status = 201
     service.tick()
-    [device] = server.bodies("/rest/v1/devices")
-    assert device["status"] == "offline"
-    assert device["fw"] == "0.1.0"
+    assert server.bodies("/rest/v1/devices") == [
+        {"id": DEVICE, "status": "offline", "status_changed_at": T0.isoformat()},
+        {"id": DEVICE, "fw": "0.1.0", "last_seen_at": T0.isoformat()},
+    ]
 
 
 def test_heartbeat_every_five_minutes(make_service, server, fake_time):
@@ -394,7 +454,7 @@ def test_flush_gives_up_after_timeout_while_supabase_is_down(make_service, serve
 def test_new_rows_do_not_cut_backoff_short(tmp_path, server, sync_flag):
     clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
     outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
-    writer = SupabaseWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
+    writer = GatewayWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
     service = Service(outbox=outbox, writer=writer, clock=clock, gateway_id="gw")
     server.status = 503
     service.handle_message(TOPIC, telemetry(0))
@@ -692,7 +752,7 @@ def test_heartbeat_retries_do_not_shorten_readings_backoff(make_service, server,
 def test_flush_never_overruns_its_deadline_on_a_hung_supabase(tmp_path, server, sync_flag):
     clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
     outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
-    writer = SupabaseWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
+    writer = GatewayWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
     service = Service(outbox=outbox, writer=writer, clock=clock, gateway_id="gw")
     for seq in range(3):
         service.handle_message(TOPIC, telemetry(seq))
@@ -704,3 +764,109 @@ def test_flush_never_overruns_its_deadline_on_a_hung_supabase(tmp_path, server, 
     reopened = Outbox(tmp_path / "outbox.db", now=lambda: T0)
     assert reopened.depth() == 3
     reopened.close()
+
+
+def test_retry_delay_starts_after_a_slow_failed_request(make_service, server, fake_time):
+    server.clock = fake_time
+    server.advance_s = 2.0
+    server.down_paths = {"/rest/v1/readings"}
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1))
+    assert service.tick() == pytest.approx(1.0)
+    attempts = server.paths().count("/rest/v1/readings")
+    assert service.tick() == pytest.approx(1.0)
+    assert server.paths().count("/rest/v1/readings") == attempts
+
+
+def test_shutdown_deadline_covers_an_in_flight_delivery_round(tmp_path, server, sync_flag):
+    clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
+    outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
+    writer = GatewayWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
+    service = Service(outbox=outbox, writer=writer, clock=clock, gateway_id="gw")
+    service.handle_message(TOPIC, telemetry(1))
+    server.delay_s = 2.0
+    service.start()
+    assert wait_for(lambda: len(server.attempts) > 0)
+    started = time.monotonic()
+    service.stop(flush_timeout=0.3)
+    assert time.monotonic() - started < 1.0
+    assert service._thread.is_alive()
+
+
+class FakePaho:
+    def __init__(self) -> None:
+        self.acks: list[tuple[int, int]] = []
+        self.disconnects = 0
+
+    def ack(self, mid: int, qos: int) -> None:
+        self.acks.append((mid, qos))
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+
+
+def paho_message(mid: int) -> mqtt.MQTTMessage:
+    msg = mqtt.MQTTMessage(mid=mid, topic=TOPIC.encode())
+    msg.payload = telemetry(1)
+    msg.qos = 1
+    return msg
+
+
+def test_failed_intake_is_not_acknowledged(monkeypatch):
+    calls = []
+
+    def failing(topic, payload, retained):
+        calls.append(topic)
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(mqtt_client, "INTAKE_RETRY_S", 0.0)
+    client = MqttClient("127.0.0.1", 1, "u", "p", failing)
+    reconnects = []
+    monkeypatch.setattr(client, "_schedule_reconnect", lambda: reconnects.append(True))
+    paho = FakePaho()
+    client._on_message(paho, None, paho_message(7))
+    assert len(calls) == mqtt_client.INTAKE_ATTEMPTS
+    assert paho.acks == []
+    assert paho.disconnects == 1
+    assert reconnects == [True]
+    assert client.intake_failures == 1
+
+
+def test_intake_is_acknowledged_after_a_transient_failure(monkeypatch):
+    calls = []
+
+    def flaky(topic, payload, retained):
+        calls.append(topic)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(mqtt_client, "INTAKE_RETRY_S", 0.0)
+    client = MqttClient("127.0.0.1", 1, "u", "p", flaky)
+    paho = FakePaho()
+    client._on_message(paho, None, paho_message(9))
+    assert paho.acks == [(9, 1)]
+    assert paho.disconnects == 0
+
+
+@needs_mosquitto
+def test_intake_failure_reconnects_and_intake_resumes(broker, monkeypatch):
+    monkeypatch.setattr(mqtt_client, "INTAKE_RETRY_S", 0.0)
+    received = []
+
+    def handler(topic, payload, retained):
+        if payload == telemetry(1):
+            raise sqlite3.OperationalError("disk I/O error")
+        received.append(payload)
+
+    client = MqttClient("127.0.0.1", broker, "olvar-gateway", "pw", handler)
+    client.start()
+    try:
+        assert client.connected.wait(5)
+        device_publish(broker, TOPIC, telemetry(1))
+        assert wait_for(lambda: client.intake_failures == 1)
+        assert wait_for(client.connected.is_set)
+        time.sleep(0.2)
+        device_publish(broker, TOPIC, telemetry(2))
+        assert wait_for(lambda: received == [telemetry(2)])
+    finally:
+        client.stop()

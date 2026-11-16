@@ -5,12 +5,17 @@ for it while it is disconnected. Mosquitto does not tell a subscriber when a que
 published, so replaying such a queue would stamp old readings with the reconnect time. Readings
 published while the gateway is away are dropped instead, just as the ESP32 drops readings while
 the broker is unreachable. Retained status messages are still delivered on every (re)subscribe.
+
+Messages are acknowledged by hand, only after the handler has committed them. If intake keeps
+failing (SQLite locked, disk full) the message is left unacknowledged and the connection is
+dropped and reopened, so the broker never records a reading as delivered that was not stored.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable
 from typing import Final
 
@@ -29,6 +34,8 @@ STATUS_FILTER: Final = "olvar/v1/+/status"
 KEEPALIVE_S: Final = 60
 RECONNECT_MIN_S: Final = 1
 RECONNECT_MAX_S: Final = 60
+INTAKE_ATTEMPTS: Final = 3
+INTAKE_RETRY_S: Final = 0.2
 
 # (topic, payload, retained) — retained is True for a retained message replayed on subscribe.
 MessageHandler = Callable[[str, bytes, bool], None]
@@ -49,10 +56,14 @@ class MqttClient:
         self._port = port
         self._handler = on_message
         self.connected = threading.Event()
+        self._lifecycle = threading.Lock()
+        self._stopping = False
+        self.intake_failures = 0
         self._client = mqtt.Client(
             callback_api_version=CallbackAPIVersion.VERSION2,
             client_id=client_id,
             protocol=mqtt.MQTTv5,
+            manual_ack=True,
         )
         self._client.username_pw_set(username, password)
         self._client.reconnect_delay_set(RECONNECT_MIN_S, RECONNECT_MAX_S)
@@ -62,6 +73,11 @@ class MqttClient:
 
     def start(self) -> None:
         """Connect in the background; paho keeps reconnecting until `stop`."""
+        with self._lifecycle:
+            self._stopping = False
+            self._connect()
+
+    def _connect(self) -> None:
         properties = Properties(PacketTypes.CONNECT)
         properties.SessionExpiryInterval = 0
         self._client.connect_async(
@@ -74,9 +90,22 @@ class MqttClient:
         self._client.loop_start()
 
     def stop(self) -> None:
-        self._client.disconnect()
-        self._client.loop_stop()
-        self.connected.clear()
+        with self._lifecycle:
+            self._stopping = True
+            self._client.disconnect()
+            self._client.loop_stop()
+            self.connected.clear()
+
+    def _schedule_reconnect(self) -> None:
+        # paho's loop cannot be restarted from its own thread, and a user disconnect ends it.
+        threading.Thread(target=self._reconnect, name="mqtt-reconnect", daemon=True).start()
+
+    def _reconnect(self) -> None:
+        with self._lifecycle:
+            if self._stopping:
+                return
+            self._client.loop_stop()
+            self._connect()
 
     def _on_connect(
         self,
@@ -108,7 +137,20 @@ class MqttClient:
 
     def _on_message(self, client: mqtt.Client, userdata: object, msg: mqtt.MQTTMessage) -> None:
         # An exception escaping a paho callback stops the network thread, and with it all intake.
-        try:
-            self._handler(msg.topic, msg.payload, bool(msg.retain))
-        except Exception:
-            log.exception("failed to handle message on %s", msg.topic)
+        for attempt in range(1, INTAKE_ATTEMPTS + 1):
+            try:
+                self._handler(msg.topic, msg.payload, bool(msg.retain))
+            except Exception:
+                log.exception(
+                    "intake failed for %s (attempt %d/%d)", msg.topic, attempt, INTAKE_ATTEMPTS
+                )
+                if attempt < INTAKE_ATTEMPTS and not self._stopping:
+                    time.sleep(INTAKE_RETRY_S)
+                    continue
+                break
+            client.ack(msg.mid, msg.qos)
+            return
+        self.intake_failures += 1
+        log.error("message on %s not acknowledged; reconnecting", msg.topic)
+        client.disconnect()
+        self._schedule_reconnect()
