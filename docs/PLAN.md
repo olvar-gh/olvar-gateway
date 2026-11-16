@@ -40,14 +40,18 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   SQL view `plant_status_v`. The dashboard and the chat function both read it. No LLM is involved.
 - **Chat with your plant:**
   - The Supabase Edge Function **`chat`** is called by the signed-in owner.
-  - It stores the user's message.
+  - It stores the user's message through an **atomic quota check** (`chat_admit`), so concurrent requests cannot
+    exceed the limits.
   - It gives DeepSeek **`deepseek-flash`** (thinking off) a context of plant profile, thresholds, `plant_status_v`,
     the latest reading, 24 h and 7 d summaries, and the last 20 messages.
   - It stores the reply and returns it. The plant answers in first person, in the language of the user's message.
   - The DeepSeek key exists only in Edge Function secrets.
   - Cost is about **$0.002 per message** at peak price.
-- **Data volume and retention:** 1,440 readings a day is about 0.3 MB/day. Raw readings are kept for **90 days**;
-  **hourly and daily summaries** are built by pg_cron.
+- **Data volume and retention:** 1,440 readings a day is about 0.3 MB/day. Raw readings are kept for **90 days**.
+  **Hourly and daily summaries** are built by pg_cron, which resumes from a persisted watermark and keeps
+  per-metric sample counts.
+- **Timeline offline periods** come from `device_offline_periods()`, which finds gaps of more than 180 s between raw
+  readings. They are available for any day within the 90-day retention.
 - **Keys:** only the new publishable and secret keys are used. Grants are explicit in every migration. There are no
   off-site backups.
 - **Testing without hardware:**
@@ -179,7 +183,8 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   3,600 × $0.30/M + 350 × $1.20/M ≈ **$0.0015 per message**.
 - **Monthly estimates:**
   - At 30 messages a day, about **$1.4/month** at worst. Off-peak hours and cache hits make it less.
-  - At the hard cap of 200 messages a day, at most about **$9/month**.
+  - At the hard cap of 200 admitted messages a day, at most about **$9/month**. If every message also used its one
+    retry (400 calls a day), at most about **$18/month**.
 
 ### 2.8 Peace lily (Spathiphyllum) care thresholds
 Sources are university extension services. 1 fc = 10.764 lux.
@@ -280,6 +285,10 @@ Sources are university extension services. 1 fc = 10.764 lux.
 | D11 | **Plain tables + pg_cron rollups** | timescaledb is deprecated on PG17 [35] | Hypertables; materialized views |
 | D12 | **Realtime INSERT on `readings` acts as a signal; clients re-read from `readings_v`** | Realtime streams tables, not views [27], and `soil_pct` exists only in the views. This costs one small query per minute | Storing `soil_pct` (rejected in D7); client-side `soil_pct` math (two places) |
 | D13 | **Lock files:** `uv` on the dev machine, `uv export` → hashed `requirements.txt` → `pip` in a venv on the Pi | No extra tool needed on the Pi | Installing uv on the Pi |
+| D14 | **Timeline offline periods = `device_offline_periods()` over raw-reading gaps > 180 s**, queried per selected day | Raw readings are the ground truth for "no data". A gap catches every cause: ESP32 offline, Wi-Fi down, broker or Pi down, gateway crash. A `boot_id` change across the gap labels it `device_restart`. No extra write path; ≈1,440 indexed rows per day | **Persisted `device_events` table from the status topic/LWT:** misses outages where the Pi or gateway itself is down, duplicates information already in `readings`, and needs another writer. **Hourly summaries:** too coarse, and empty hours have no row |
+| D15 | **Rollups resume from a persisted watermark** (`rollup_state.processed_until`) and recompute touched buckets from raw; **daily is computed from raw**; **per-metric `_n` counts** | A job outage of any length is caught up on the next run. Daily values are exact for any timezone. Intermittent null sensors are weighted correctly. Retention never deletes raw rows that are not yet rolled up | A fixed 2 h lookback (outages longer than that leave permanent gaps); daily weighted from hourly by total `n` (wrong when sensors return null) |
+| D16 | **Uploader classifies failures**: only SQLSTATE class 22/23 rows are dead-lettered; auth, permission and config errors keep the queue | A revoked key or missing grant must not dead-letter the whole valid backlog | Row-by-row retry on any 4xx |
+| D17 | **Chat quota enforced by `chat_admit()`**: one transaction with a per-plant row lock, both limits checked, then insert | A count-then-insert done in separate steps lets concurrent requests exceed the cost cap | Counting in the Edge Function; in-memory limiter (Edge Functions are stateless and distributed) |
 
 ---
 
@@ -327,22 +336,37 @@ with `soil_calibrated_at`.
 - **After recalibration, every past reading and summary is re-expressed with the new calibration.** Rows are never
   rewritten; see D7 and R6.
 
-**Status pill.** The pill comes from the view `public.plant_status_v`, one row per plant:
-- `overall`: one of `great | okay | needs_attention | in_trouble | offline | no_data`. The dashboard maps it to text
-  such as "Feeling great".
-- Per-metric status for temperature, humidity, light and soil: one of
-  `critical_low | low | ok | high | critical_high | unknown`.
-- Supporting columns: `latest_reading_at`, `issues`, and `soil_calibrated`.
+**Status pill.** The pill comes from the view `public.plant_status_v`, one row per plant. The dashboard contains no
+threshold logic.
+- `overall`: one of `great | okay | needs_attention | in_trouble | offline | no_data`, plus `overall_label` (English
+  text such as "Feeling great").
+- Per-metric `<metric>_status`: one of `critical_low | low | ok | high | critical_high | unknown`, plus
+  `<metric>_label` (e.g. "Too dry"), for temperature, humidity, light and soil.
+- `summary`: a deterministic one-line text such as "Soil is getting dry — water soon".
+- `computed_at`, `latest_reading_at`, `issues` and `soil_calibrated`.
+- **Offline** means no reading for more than **180 s**, or a retained `offline` status. The dashboard uses the same
+  180 s rule only to age its cached row between refetches.
 
 **Chat.** The Edge Function `chat`:
 - Request: `POST /functions/v1/chat` with the user's JWT and body `{"plant_id": uuid, "message": string ≤ 1000}`.
 - Response: `{"reply": {chat_messages row}}`.
-- Messages are stored in `chat_messages`. The dashboard lists them from that table and subscribes to its INSERTs.
+- The reply row carries `based_on_reading_at`: the time of the reading the answer was based on.
+- Rate limits: 10 user messages per 5 min and 200 per rolling 24 h per plant. They are enforced **atomically** in the
+  database (§5.6 `chat_admit`). Over the limit the function returns 429 with `retry_after`.
+- Messages are stored in `chat_messages`, a single conversation per plant. The dashboard lists them from that table
+  and subscribes to its INSERTs.
+
+**Timeline offline periods.** The SQL function `public.device_offline_periods(p_device_id, p_from, p_to)` returns
+`(started_at, ended_at, duration_s, cause, ongoing)`, where `cause` is `device_restart` or `no_data`.
+- It is computed from gaps of **more than 180 s between consecutive raw readings** (decision D14).
+- It is therefore available for any selected day **within the 90-day raw retention**.
+- Beyond 90 days the Timeline shows no offline periods.
 
 **Dashboard reads** go through RLS and require a signed-in session; nothing is granted to `anon`.
 - `readings_v` for windows ≤ 48 h, `readings_hourly_v` for ≤ 90 d, and `readings_daily_v` beyond that.
-- `plant_status_v`, `plants` (the dashboard may update `nickname` and `timezone`), `devices` (calibration columns are
-  writable), and `chat_messages`.
+- `plant_status_v`, `device_offline_periods()`, `devices` (calibration columns are writable), and `chat_messages`.
+- `plants`: the dashboard may update `nickname`, `location`, `timezone` and `threshold_overrides`. The overrides are
+  validated by a check constraint.
 - Realtime publication: `readings` (INSERT, used as a signal), `devices` (UPDATE), `chat_messages` (INSERT).
 
 **Types.** `supabase/types/database.types.ts` is generated and committed in olvar-gateway. The dashboard syncs a
@@ -370,7 +394,8 @@ ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
                          ▼  PostgREST, secret key "gateway"
    Postgres: readings · devices(calibration) · plants · plant_profiles · readings_hourly/daily · chat_messages · gateways
      views:  readings_v / readings_hourly_v / readings_daily_v (soil_pct)   plant_status_v (pill)
-     pg_cron: :05 hourly → refresh_rollups · 03:30 UTC → delete raw > 90 d
+     pg_cron: :05 hourly → refresh_rollups (watermark) · 03:30 UTC → delete rolled-up raw > 90 d
+     fns:    device_offline_periods() (Timeline) · chat_admit() (atomic quota)
                          ▲                                   ▲
    Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ DeepSeek deepseek-flash
           └── Realtime: readings INSERT (signal), devices UPDATE, chat_messages INSERT
@@ -463,7 +488,19 @@ class SupabaseWriter:
   - Request: `POST /rest/v1/readings?on_conflict=device_id,boot_id,seq` with
     `Prefer: resolution=ignore-duplicates,return=minimal` and the `apikey` header [19][21].
   - Network errors, 5xx and 429 responses trigger exponential backoff with jitter, from 1 s up to 5 min.
-  - On a 4xx it retries row by row; the offending row goes to the dead-letter table and the rest are acknowledged.
+  - **Failures are classified before anything is dead-lettered.** Only *row-specific* data errors are isolated:
+    PostgreSQL SQLSTATE class **22** (data exception) or **23** (integrity, e.g. `23502`, `23503`, `23514`), as
+    reported in the PostgREST error body `code`.
+    - The batch is bisected until the offending rows are found.
+    - Only those rows go to the dead-letter table; the rest are acknowledged.
+  - **Request-wide failures never dead-letter.** These are:
+    - 401 or 403, including `42501` permission denied (revoked or rotated key, missing grant);
+    - 404, or any `PGRST*` code (missing table, schema cache);
+    - any other unclassified 4xx.
+
+    For these, the whole batch **stays queued** and the uploader backs off (capped at 5 min). It logs one ERROR
+    each time the error class changes, and `olvar-gateway status` shows `last_error` and the queue depth. Delivery
+    resumes by itself once the credentials or grants are fixed.
   - Device rows are upserted with only `{id, fw, last_seen_at}`, so the calibration and owner columns are never touched.
 - **MQTT:**
   - Client id `olvar-gateway`, MQTT 5, `clean_start=False`, session expiry of one day.
@@ -510,8 +547,10 @@ create table public.plants (
   owner_id uuid not null references auth.users(id) on delete cascade,
   profile_id text not null references public.plant_profiles(id),
   nickname text not null default 'Lily' check (char_length(nickname) between 1 and 40),
+  location text check (char_length(location) <= 60),   -- free text, e.g. "Living room window"
   timezone text not null default 'UTC',         -- IANA; set by setup script, editable in Settings
-  threshold_overrides jsonb not null default '{}',
+  threshold_overrides jsonb not null default '{}'
+    check (public.valid_threshold_overrides(threshold_overrides)),  -- known metrics/keys, numbers, ascending order
   created_at timestamptz not null default now()
 );
 create index plants_owner_idx on public.plants (owner_id);
@@ -569,7 +608,7 @@ create view public.readings_v with (security_invoker = true) as
 
 -- grants (explicit, required since the 2026 default-privileges change [11])
 grant select on public.plant_profiles, public.plants, public.devices, public.readings, public.readings_v, public.gateways to authenticated;
-grant update (nickname, timezone) on public.plants to authenticated;
+grant update (nickname, location, timezone, threshold_overrides) on public.plants to authenticated;
 grant update (soil_dry_raw, soil_wet_raw, soil_calibrated_at) on public.devices to authenticated;
 grant select, insert, update, delete on public.plant_profiles, public.plants, public.devices, public.readings, public.gateways to service_role;
 grant select on public.readings_v to service_role;
@@ -594,40 +633,78 @@ create extension if not exists pg_cron;
 create table public.readings_hourly (
   device_id text not null references public.devices(id) on delete cascade,
   bucket timestamptz not null,                                  -- UTC hour
-  n integer not null,
-  temperature_c_avg real, temperature_c_min real, temperature_c_max real,
-  humidity_pct_avg real,  humidity_pct_min real,  humidity_pct_max real,
-  lux_avg real, lux_min real, lux_max real,
-  soil_raw_avg real, soil_raw_min smallint, soil_raw_max smallint,
+  n integer not null,                                           -- readings in the bucket (coverage)
+  -- per-metric non-null sample counts: SQL aggregates skip nulls, so each metric is weighted by its own n
+  temperature_c_n integer not null, temperature_c_avg real, temperature_c_min real, temperature_c_max real,
+  humidity_pct_n  integer not null, humidity_pct_avg real,  humidity_pct_min real,  humidity_pct_max real,
+  lux_n           integer not null, lux_avg real, lux_min real, lux_max real,
+  soil_raw_n      integer not null, soil_raw_avg real, soil_raw_min smallint, soil_raw_max smallint,
   primary key (device_id, bucket)
 );
 -- readings_daily: same columns, `bucket date` = local date in plants.timezone (UTC if no plant).
+-- Daily rows are computed DIRECTLY FROM RAW readings of that local date (raw exists for 90 d, so every late row can
+-- still be folded in). That is exact for any timezone offset (incl. :30/:45). Combining hourly rows elsewhere must
+-- use sum(<m>_avg * <m>_n) / nullif(sum(<m>_n), 0), never the total n.
 -- readings_hourly_v / readings_daily_v (security_invoker): add soil_pct_avg = soil_pct(soil_raw_avg),
 --   soil_pct_min = soil_pct(soil_raw_max), soil_pct_max = soil_pct(soil_raw_min)   (inverted: higher raw = drier)
-create function public.refresh_rollups(since timestamptz) returns void
+
+-- persisted watermark: the job resumes from where it last succeeded, however long it was down
+create table public.rollup_state (
+  id boolean primary key default true check (id),              -- single row
+  processed_until timestamptz not null default '-infinity'
+);
+create function public.refresh_rollups() returns void
   language plpgsql security definer set search_path = '' as $$ … $$;
-  -- recompute every (device, hour) touched by rows RECEIVED since `since` (late buffered rows fold in);
-  -- daily = weighted from hourly (sum(avg*n)/sum(n)); idempotent upserts
-revoke execute on function public.refresh_rollups(timestamptz) from public, anon, authenticated;
-select cron.schedule('olvar-rollups',   '5 * * * *',  $$select public.refresh_rollups(now() - interval '2 hours')$$);
-select cron.schedule('olvar-retention', '30 3 * * *', $$delete from public.readings where recorded_at < now() - interval '90 days'$$);
--- grants/RLS mirror readings (select to authenticated via devices.owner_id; all to service_role)
+  -- 1. pg_try_advisory_xact_lock(<const>) → return if another run holds it (overlapping cron runs)
+  -- 2. lo := processed_until - interval '10 minutes'  (overlap; recompute is idempotent)
+  --    hi := now() - interval '2 minutes'           (lag: received_at = insert txn start, upload txns are short)
+  -- 3. touched := distinct (device_id, hour) and (device_id, local date) of readings with received_at in (lo, hi]
+  -- 4. recompute those hourly + daily buckets from raw (upsert on PK)
+  -- 5. update rollup_state set processed_until = hi    -- same transaction: all-or-nothing
+create function public.rebuild_rollups(p_from timestamptz, p_to timestamptz) returns void …  -- manual repair
+revoke execute on function public.refresh_rollups(), public.rebuild_rollups(timestamptz, timestamptz)
+  from public, anon, authenticated;
+select cron.schedule('olvar-rollups', '5 * * * *', $$select public.refresh_rollups()$$);
+-- retention never deletes rows that are not yet rolled up (if the job is down for > 90 d, raw rows are kept)
+select cron.schedule('olvar-retention', '30 3 * * *', $$
+  delete from public.readings
+  where recorded_at < now() - interval '90 days'
+    and received_at <= (select processed_until from public.rollup_state) $$);
+-- grants/RLS mirror readings (select to authenticated via devices.owner_id; all to service_role);
+-- rollup_state: no grants to anon/authenticated
 
 -- ===== 20261116000300_status.sql =====
 -- effective_thresholds(plant_id) = profile.thresholds deep-merged per metric with plants.threshold_overrides
 -- plant_status_v (security_invoker), one row per plant the caller can see:
 --   plant_id, device_id, latest_reading_at, device_status, soil_calibrated boolean,
 --   temperature_status, humidity_status, light_status, soil_status   -- critical_low|low|ok|high|critical_high|unknown
+--   temperature_label, humidity_label, light_label, soil_label       -- English, e.g. 'Just right', 'Too dry'
 --   issues text[]                                                    -- metric keys, worst first
 --   overall text  -- great | okay | needs_attention | in_trouble | offline | no_data
+--   overall_label text  -- 'Feeling great' | 'Doing okay' | 'Needs attention' | 'In trouble' | 'Offline' | 'No data yet'
+--   summary text        -- one deterministic line from the worst issue, e.g. 'Soil is getting dry — water soon'
+--   computed_at timestamptz  -- now() at query time
 -- Rules (thresholds in §2.8):
---   no reading ever → no_data;  latest reading > 5 min old or device_status = 'offline' → offline
+--   no reading ever → no_data;  latest reading > 180 s old or device_status = 'offline' → offline
 --   temperature/humidity: median of last 30 min; humidity "high" only if > high for 12 h
 --   light: daytime (08–18 local) mean over 24 h for low side; max 10-min median for high side
 --   soil: latest 10-min median of soil_pct via readings_v; unknown if uncalibrated; "high" only if > high for 48 h
 --   any critical_* → in_trouble; any low/high → needs_attention; all ok and every value in the middle half of its
 --   ok band → great; else okay. unknown metrics never raise severity.
 grant select on public.plant_status_v to authenticated, service_role;
+
+-- Timeline offline periods, derived from raw-reading gaps (D14); security invoker → RLS on readings applies
+create function public.device_offline_periods(p_device_id text, p_from timestamptz, p_to timestamptz)
+  returns table (started_at timestamptz, ended_at timestamptz, duration_s integer,
+                 cause text,          -- 'device_restart' (boot_id changed across the gap) | 'no_data'
+                 ongoing boolean)     -- true for a gap still open at now()
+  language sql stable security invoker set search_path = '' as $$ … $$;
+  -- readings in [p_from, p_to] plus the last reading before p_from and the first after p_to (clips gaps that
+  -- cross the window edges); lag(recorded_at) over (order by recorded_at); a gap > 180 s yields
+  -- (prev.recorded_at + 60 s, next.recorded_at); the trailing gap to least(now(), p_to) is ongoing.
+  -- Only 'ntp'/'backfilled' rows are used. Uses readings_device_time_idx; one day ≈ 1,440 rows.
+  -- p_to - p_from is capped at 7 days (raises otherwise). Beyond the 90-day retention it returns nothing.
+grant execute on function public.device_offline_periods(text, timestamptz, timestamptz) to authenticated, service_role;
 
 -- ===== 20261116000400_chat.sql =====
 create table public.chat_messages (
@@ -636,6 +713,7 @@ create table public.chat_messages (
   role text not null check (role in ('user','plant')),
   content text not null check (char_length(content) between 1 and 2000),
   created_at timestamptz not null default now(),
+  based_on_reading_at timestamptz,                            -- 'plant' rows: recorded_at of the latest reading used
   model text, tokens_in integer, tokens_out integer,          -- set on 'plant' rows
   error text                                                  -- set when the plant reply is a fallback
 );
@@ -647,15 +725,31 @@ create policy chat_read on public.chat_messages for select to authenticated
   using (plant_id in (select p.id from public.plants p where p.owner_id = (select auth.uid())));
 alter publication supabase_realtime add table public.chat_messages;
 -- inserts happen only inside the `chat` function (service role), so clients cannot forge 'plant' messages
+
+-- atomic admission: one transaction serializes per plant, checks both quotas, inserts the user's message
+create function public.chat_admit(p_owner_id uuid, p_plant_id uuid, p_content text)
+  returns public.chat_messages
+  language plpgsql security definer set search_path = '' as $$ … $$;
+  -- 1. select 1 from public.plants where id = p_plant_id and owner_id = p_owner_id for update
+  --    (row lock: concurrent calls for the same plant queue here; not found → raise 'P0002' plant_not_found)
+  -- 2. count role='user' rows for the plant in the last 5 min and the last 24 h
+  -- 3. over 10 / 200 → raise exception using errcode = 'P0429', detail = retry_after seconds
+  -- 4. insert the 'user' row and return it — all in the same transaction as the lock
+revoke execute on function public.chat_admit(uuid, uuid, text) from public, anon, authenticated;
+grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
 ```
 
 ### 5.7 Edge Function `chat` (Deno/TypeScript)
 1. **Auth:** require the caller's JWT (`verify_jwt` stays on) [33]. Read the plant through a user-scoped client;
    RLS then proves ownership, and a non-owner gets 404.
 2. **Input:** `message` is trimmed and must be 1–1000 characters.
-   - Rate limit: at most 10 user messages per 5 min and 200 per day for each plant, counted from `chat_messages`.
-     Over the limit, return 429 with a `retry_after` value.
-3. **Store** the user's row with the admin client (`role='user'`).
+3. **Admit and store atomically.**
+   - Call `rpc('chat_admit', {p_owner_id: <sub from the verified JWT>, p_plant_id, p_content})` with the admin
+     client. One database transaction locks the plant row, checks **10 per 5 min** and **200 per rolling 24 h**, and
+     inserts the user's row.
+   - Concurrent requests therefore cannot both pass at 199/200, so the cost cap holds.
+   - Error mapping: `P0429` returns HTTP 429 with `retry_after`; `P0002` returns 404.
+   - Each admitted message makes at most 2 DeepSeek calls (1 retry), so the worst case is 400 calls a day.
 4. **Build the context:**
    - plant nickname and profile `care_notes`;
    - the effective thresholds;
@@ -671,7 +765,8 @@ alter publication supabase_realtime add table public.chat_messages;
    - Timeout of 25 s; one retry on 429, 5xx or an empty reply.
    - `DEEPSEEK_MODEL` and `DEEPSEEK_BASE_URL` can be overridden through env (the base URL is used for the test
      stub).
-6. **Store the reply** with `role='plant'`, the model name and the token usage, then return it.
+6. **Store the reply** with `role='plant'`, `based_on_reading_at` (the `recorded_at` of the latest reading in the
+   context), the model name and the token usage, then return it.
    - If DeepSeek fails, store and return a short deterministic fallback built from `plant_status_v`, with `error` set,
      so the conversation never hangs.
 
@@ -698,13 +793,13 @@ tests. Depending on what it touches, it must pass `uv run pytest`, `supabase tes
 
 | ID | Owner files | Depends on | Acceptance criteria | Verify (no hardware) |
 |---|---|---|---|---|
-| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Seed:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources), a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
-| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. Daily values are weighted by `n` and use the local date. The views compute inverted soil min/max. Retention deletes only rows > 90 d. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
-| **T3 Status view** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status for every rule in §5.6, including `no_data`, `offline`, uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules | Table-driven pgTAP with fixed `now()` via fixtures |
-| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
+| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Seed:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources), a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
+| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C in the review example), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. Retention deletes only rows > 90 d that are at or below the watermark. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
+| **T3 Status view + offline periods** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status, labels and summary for every rule in §5.6, including `no_data`, `offline` (> 180 s), uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules. `device_offline_periods` returns: gaps > 180 s only; gaps clipped at the window edges; a gap spanning midnight in both days' results; `device_restart` when `boot_id` changes; `ongoing` for an open trailing gap; nothing for another owner's device (RLS); an error for a window > 7 days | Table-driven pgTAP with fixed `now()` via fixtures |
+| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
 | **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
-| **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. The uploader handles 2xx, 5xx, network errors and 4xx row isolation, and sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
-| **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines | pytest with fakes; `python -m olvar_gateway --check-config` |
+| **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. The uploader handles 2xx, 5xx and network errors. **Classification:** a 401/403/`42501`/404/`PGRST*` response leaves every row queued with `last_error` set, and delivery resumes once the mock is fixed; a batch with one `23514` row dead-letters only that row (bisection). It sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
+| **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines. `python -m olvar_gateway status` prints the queue depth, dead-letter count and `last_error` | pytest with fakes; `python -m olvar_gateway --check-config` |
 | **T8 Fake device + E2E** | `tools/fake_esp32.py`, `dev/compose.yml`, `tests/e2e/**` | T7 | The fake device simulates a day/night lux curve, soil_raw drying and a watering jump (higher = drier), a reboot (new boot_id, seq reset), QoS 1 duplicates, garbage payloads, null sensors, `rssi_dbm`, and the LWT on SIGKILL. **E2E:** the happy path inserts N rows; Supabase down for 2 min loses nothing and creates no duplicates; a gateway restart loses nothing; a spoofed id is rejected; the LWT makes the device offline and `plant_status_v.overall = offline` | `docker compose -f dev/compose.yml up -d && supabase start && uv run pytest -m e2e` |
 | **T9 Pi deployment & setup** | `deploy/**`, `tools/setup_plant.py`, `docs/DEPLOY.md`, `docs/RUNBOOK.md` | T7 | `install.sh` is idempotent: apt packages, `olvar` user, venv, env file 0640, unit with `StateDirectory` and sandboxing, journald cap, nftables. `update.sh` checks out a tag, installs pinned dependencies and restarts. `setup_plant.py` creates the one plant and device (owner email → owner_id, timezone) and prints the `mosquitto_passwd` command | Debian Trixie arm64 container (`systemd-analyze verify`, `shellcheck`) |
 | **T10 CI + types** | `.github/workflows/ci.yml`, `supabase/types/database.types.ts`, `README.md` | T1–T4 | Jobs: ruff + pytest; supabase start, db reset and test db; deno test; type generation, which fails the build if the committed file differs | GitHub Actions green |
@@ -774,12 +869,16 @@ retention, DeepSeek use, MQTT encryption, backups).
 - **R5 DeepSeek.**
   - Thinking is on by default and must be disabled [41].
   - Models and prices change often [38], so `DEEPSEEK_MODEL` is configurable.
-  - The daily cap of 200 messages bounds the cost at about $9/month in the worst case.
+  - The daily cap of 200 admitted messages is enforced atomically. It bounds the cost at about $9/month, or $18/month
+    if every call is retried.
 - **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration. If the probe is moved
   to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the
   upgrade path after v1.
 - **R7 Soil thresholds.** The 20/35/85/90% values are heuristics, because no extension source gives sensor
   percentages. They can be tuned through `plants.threshold_overrides` without a deploy.
+- **R11 Offline history horizon.** Offline periods are derived from raw readings, so the Timeline cannot show them
+  for days older than 90 days. If that is ever needed, persist the gaps from `refresh_rollups` into a small table
+  before retention runs.
 - **R8 Light.** The BH1750 measures illuminance in lux, not PAR. The thresholds are approximate conversions from
   extension guidance written in foot-candles [50][54].
 - **R9 Firmware QoS.** QoS 1 publishing needs `esp-mqtt` or an equivalent client; `PubSubClient` only publishes
