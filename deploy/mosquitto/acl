@@ -1,0 +1,7 @@
+# Installed as /etc/mosquitto/acl (mosquitto:mosquitto 0600). The MQTT username of a device is its device_id.
+pattern write olvar/v1/%u/telemetry
+pattern write olvar/v1/%u/status
+
+user olvar-gateway
+topic read olvar/v1/+/telemetry
+topic read olvar/v1/+/status

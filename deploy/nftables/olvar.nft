@@ -1,0 +1,14 @@
+# Installed as /etc/nftables.d/olvar.nft; install.sh replaces @LAN4@ with the Pi's LAN subnet.
+# Mosquitto runs without TLS, so the broker must only be reachable from the home network.
+table inet olvar
+delete table inet olvar
+
+table inet olvar {
+	chain input {
+		type filter hook input priority filter - 1; policy accept;
+		iifname "lo" tcp dport 1883 accept
+		ip saddr @LAN4@ tcp dport 1883 accept
+		ip6 saddr fe80::/10 tcp dport 1883 accept
+		tcp dport 1883 drop
+	}
+}
