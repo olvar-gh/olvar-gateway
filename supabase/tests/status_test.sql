@@ -3,7 +3,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local timezone = 'UTC';
-select plan(66);
+select plan(68);
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Fixtures (as postgres): owner A with one plant per status scenario, owner B with one plant.
@@ -110,6 +110,11 @@ insert into public.devices (id, owner_id, status) values ('gaps-a', '11111111-11
 -- gaps-b: silent for the last 7 min (an ongoing outage)
 insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms)
 values ('gaps-b', now() - interval '7 minutes', 'b3b3b3b3', 0, 0);
+-- gaps-future: silent for 10 min, plus a reading wrongly dated tomorrow that must not close the outage
+insert into public.devices (id, owner_id, status) values ('gaps-future', '11111111-1111-4111-8111-111111111111', 'online');
+insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms) values
+  ('gaps-future', now() - interval '10 minutes', 'b4b4b4b4', 0, 0),
+  ('gaps-future', now() + interval '1 day',      'b4b4b4b4', 1, 1);
 
 insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms)
 select 'gaps-a', ts, boot, row_number() over (partition by boot order by ts) - 1, 0
@@ -259,6 +264,16 @@ select results_eq(
     from public.device_offline_periods('gaps-b', now() - interval '1 hour', now() - interval '5 minutes')$$,
   $$values (now() - interval '6 minutes', now() - interval '5 minutes', 60, 'no_data', true)$$,
   'an ongoing outage that began < 180 s before p_to is still clipped into that window');
+select results_eq(
+  $$select started_at, ended_at, duration_s, cause, ongoing
+    from public.device_offline_periods('gaps-future', now() - interval '1 hour', now() + interval '2 hours')$$,
+  $$values (now() - interval '9 minutes', now(), 540, 'no_data', true)$$,
+  'a future-dated reading neither closes an ongoing outage nor extends it past now()');
+select results_eq(
+  $$select started_at, ended_at, duration_s, cause, ongoing
+    from public.device_offline_periods('gaps-future', now() - interval '1 hour', now())$$,
+  $$values (now() - interval '9 minutes', now(), 540, 'no_data', true)$$,
+  'a future-dated reading does not close an outage in a window ending at now()');
 select is((select count(*)::int from m, public.device_offline_periods('gaps-a', m.m - interval '150 minutes',
                                                                      m.m - interval '145 minutes')),
           0, 'a window with readings and no gap > 180 s returns nothing');

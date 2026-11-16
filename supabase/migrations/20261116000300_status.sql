@@ -223,7 +223,8 @@ from ov o;
 -- cross the window edges are clipped to it (a gap across midnight appears in both days). A gap yields
 -- (prev + 60 s, next); cause is device_restart when boot_id changed across it. The trailing gap from the last
 -- reading is ongoing when now() is more than 180 s after that reading; it ends at least(now(), p_to) and is clipped
--- like any other gap, so an outage that began just before p_to still shows in that window. Only 'ntp'/'backfilled' rows. Window ≤ 7 days. Security invoker, so a
+-- like any other gap, so an outage that began just before p_to still shows in that window. Readings dated after
+-- now() are ignored (same rule as plant_status_v). Only 'ntp'/'backfilled' rows. Window ≤ 7 days. Security invoker, so a
 -- device the caller cannot see has no readings and returns nothing; so does a window beyond the 90-day retention.
 -- ---------------------------------------------------------------------------------------------------------------
 create function public.device_offline_periods(p_device_id text, p_from timestamptz, p_to timestamptz)
@@ -237,17 +238,20 @@ begin
     raise exception 'window longer than 7 days' using errcode = '22023';
   end if;
   return query
+  -- readings dated after now() (clock errors) are ignored, so they can neither close nor extend an outage
   with pts as (
     (select r.recorded_at, r.boot_id from public.readings r
-     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at < p_from
+     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at <= now()
+       and r.recorded_at < p_from
      order by r.recorded_at desc limit 1)
     union all
     (select r.recorded_at, r.boot_id from public.readings r
-     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled')
+     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at <= now()
        and r.recorded_at between p_from and p_to)
     union all
     (select r.recorded_at, r.boot_id from public.readings r
-     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at > p_to
+     where r.device_id = p_device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at <= now()
+       and r.recorded_at > p_to
      order by r.recorded_at asc limit 1)
   ),
   seq as (
