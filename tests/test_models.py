@@ -322,3 +322,21 @@ def test_to_row_carries_nulls():
 def test_model_validates_directly():
     t = Telemetry.model_validate({**BASE, "lux": -5})
     assert t.lux is None and t.out_of_range == ("lux",)
+
+
+def test_explicit_null_rssi_rejected():
+    with pytest.raises(InvalidMessage) as exc:
+        parse_message(TOPIC, payload(rssi_dbm=None))
+    assert exc.value.reason == "invalid_rssi_dbm"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("boot_id", "3fa9c2e1\n"), ("device_id", "olvar-a1b2c3\n")],
+)
+def test_trailing_newline_identifiers_rejected_by_schema_and_model(field, value):
+    data = {**BASE, field: value}
+    assert not jsonschema.Draft202012Validator(SCHEMA).is_valid(data)
+    topic = f"olvar/v1/{data['device_id']}/telemetry"
+    with pytest.raises(InvalidMessage):
+        parse_message(topic, json.dumps(data).encode())

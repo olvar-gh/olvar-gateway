@@ -18,13 +18,17 @@
   "properties": {
     "device_id": {
       "type": "string",
-      "pattern": "^[a-z0-9][a-z0-9-]{2,31}$",
+      "pattern": "^[a-z0-9][a-z0-9-]{2,31}(?![\\s\\S])",
+      "minLength": 3,
+      "maxLength": 32,
       "not": { "const": "olvar-gateway" },
       "description": "Default \"olvar-\" + last 6 hex chars of the MAC, lowercase. Equals the MQTT username and client id."
     },
     "boot_id": {
       "type": "string",
-      "pattern": "^[0-9a-f]{8}$",
+      "pattern": "^[0-9a-f]{8}(?![\\s\\S])",
+      "minLength": 8,
+      "maxLength": 8,
       "description": "8 random lowercase hex characters, generated once per ESP32 boot."
     },
     "seq": {
@@ -56,7 +60,7 @@
     },
     "rssi_dbm": {
       "type": "integer",
-      "description": "Optional Wi-Fi signal strength."
+      "description": "Optional Wi-Fi signal strength. Omit the key when unknown; null is not allowed."
     },
     "fw": {
       "type": "string",

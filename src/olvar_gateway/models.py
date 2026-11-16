@@ -61,6 +61,13 @@ def _integral(value: Any) -> Any:
 Int = Annotated[int, BeforeValidator(_integral)]
 
 
+def _not_null(value: Any) -> Any:
+    # rssi_dbm is optional, not nullable: omit the key instead. Omitted stays None (default).
+    if value is None:
+        raise ValueError("must be an integer when present; omit the key instead of null")
+    return value
+
+
 class Telemetry(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True, allow_inf_nan=False)
 
@@ -72,7 +79,7 @@ class Telemetry(BaseModel):
     humidity_pct: float | None
     lux: float | None
     soil_raw: Int | None
-    rssi_dbm: Int | None = None
+    rssi_dbm: Annotated[Int | None, BeforeValidator(_not_null)] = None
     fw: Annotated[str, Field(min_length=1, max_length=64)]
 
     _out_of_range: tuple[str, ...] = PrivateAttr(default=())
