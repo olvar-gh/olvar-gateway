@@ -287,6 +287,9 @@ Sources are university extension services. 1 fc = 10.764 lux.
 | D13 | **Lock files:** `uv` on the dev machine, `uv export` → hashed `requirements.txt` → `pip` in a venv on the Pi | No extra tool needed on the Pi | Installing uv on the Pi |
 | D14 | **Timeline offline periods = `device_offline_periods()` over raw-reading gaps > 180 s**, queried per selected day | Raw readings are the ground truth for "no data". A gap catches every cause: ESP32 offline, Wi-Fi down, broker or Pi down, gateway crash. A `boot_id` change across the gap labels it `device_restart`. No extra write path; ≈1,440 indexed rows per day | **Persisted `device_events` table from the status topic/LWT:** misses outages where the Pi or gateway itself is down, duplicates information already in `readings`, and needs another writer. **Hourly summaries:** too coarse, and empty hours have no row |
 | D15 | **Rollups resume from a persisted watermark** (`rollup_state.processed_until`) and recompute touched buckets from raw; **daily is computed from raw**; **per-metric `_n` counts** | A job outage of any length is caught up on the next run. Daily values are exact for any timezone. Intermittent null sensors are weighted correctly. Retention never deletes raw rows that are not yet rolled up | A fixed 2 h lookback (outages longer than that leave permanent gaps); daily weighted from hourly by total `n` (wrong when sensors return null) |
+| D18 | **Sealed buckets** (`rollup_seals.sealed_before`, an hour-aligned local-midnight cutoff advanced only by `apply_retention()`): buckets starting before it are never recomputed; late rows falling into them are counted and dropped | Recomputing a bucket from partially deleted raw rows would replace a complete summary with a wrong one (e.g. daily {10, 30} → 20, then a late 30 after retention → 30 instead of 23.33) | Incremental merge of late rows into sealed buckets (not idempotent without tracking every merged row); keeping raw longer than 90 d (contradicts the decision) |
+| D19 | **Soil % averages from an exact `soil_raw` value→count distribution** stored per bucket, evaluated with the current calibration | It equals the mean of per-reading clamped percentages under any recalibration; small (≈3 MB/year) | `soil_pct(soil_raw_avg)` (wrong when readings fall outside the calibration endpoints); storing `soil_pct` (cannot follow a recalibration) |
+| D20 | **`plants.timezone` validated by trigger against `pg_timezone_names`** (errcode 22023) | A typo would otherwise break local-date rollups and daytime status, and stall the rollup watermark | CHECK with an "immutable" wrapper (pg_timezone_names isn't immutable); validating only in the dashboard (the Data API is reachable directly) |
 | D16 | **Uploader classifies failures**: only SQLSTATE class 22/23 rows are dead-lettered; auth, permission and config errors keep the queue | A revoked key or missing grant must not dead-letter the whole valid backlog | Row-by-row retry on any 4xx |
 | D17 | **Chat quota enforced by `chat_admit()`**: one transaction with a per-plant row lock, both limits checked, then insert | A count-then-insert done in separate steps lets concurrent requests exceed the cost cap | Counting in the Edge Function; in-memory limiter (Edge Functions are stateless and distributed) |
 
@@ -394,7 +397,7 @@ ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
                          ▼  PostgREST, secret key "gateway"
    Postgres: readings · devices(calibration) · plants · plant_profiles · readings_hourly/daily · chat_messages · gateways
      views:  readings_v / readings_hourly_v / readings_daily_v (soil_pct)   plant_status_v (pill)
-     pg_cron: :05 hourly → refresh_rollups (watermark) · 03:30 UTC → delete rolled-up raw > 90 d
+     pg_cron: :05 hourly → refresh_rollups (watermark) · 03:30 UTC → apply_retention (catch up, seal, delete raw > 90 d)
      fns:    device_offline_periods() (Timeline) · chat_admit() (atomic quota)
                          ▲                                   ▲
    Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ DeepSeek deepseek-flash
@@ -483,6 +486,8 @@ class SupabaseWriter:
     `/var/lib/olvar-gateway/outbox.db`.
   - A unique index on `(device_id, boot_id, seq)`.
   - It holds at most 100k rows, about 70 days for one device. Above that, the oldest rows are dropped with an ERROR log.
+  - Rows whose `recorded_at` is older than 89 days are dead-lettered as `beyond_retention`; their summary buckets
+    are sealed (§5.6).
 - **Uploader:**
   - It runs on each new row and on a 5 s tick.
   - Request: `POST /rest/v1/readings?on_conflict=device_id,boot_id,seq` with
@@ -548,12 +553,29 @@ create table public.plants (
   profile_id text not null references public.plant_profiles(id),
   nickname text not null default 'Lily' check (char_length(nickname) between 1 and 40),
   location text check (char_length(location) <= 60),   -- free text, e.g. "Living room window"
-  timezone text not null default 'UTC',         -- IANA; set by setup script, editable in Settings
+  timezone text not null default 'UTC',         -- IANA; set by setup script, editable in Settings;
+                                                -- validated by trigger plants_validate_timezone (below)
   threshold_overrides jsonb not null default '{}'
     check (public.valid_threshold_overrides(threshold_overrides)),  -- known metrics/keys, numbers, ascending order
   created_at timestamptz not null default now()
 );
 create index plants_owner_idx on public.plants (owner_id);
+
+-- timezone must be a real IANA zone name known to this Postgres (rejects typos like 'Asia/Seol' and POSIX
+-- strings like 'UTC+3' that "at time zone" would silently accept). A trigger rather than a CHECK, because
+-- pg_timezone_names is not immutable.
+create function public.validate_plant_timezone() returns trigger
+  language plpgsql set search_path = '' as $$
+begin
+  if not exists (select 1 from pg_catalog.pg_timezone_names where name = new.timezone) then
+    raise exception 'unknown timezone: %', new.timezone using errcode = '22023';   -- invalid_parameter_value
+  end if;
+  return new;
+end $$;
+create trigger plants_validate_timezone before insert or update of timezone on public.plants
+  for each row execute function public.validate_plant_timezone();
+-- The dashboard shows error 22023 as "Unknown timezone". Validation happens at the write boundary, so
+-- refresh_rollups() and plant_status_v never see an invalid zone and the watermark cannot get stuck on one.
 
 create table public.devices (
   id text primary key check (id ~ '^[a-z0-9][a-z0-9-]{2,31}$' and id <> 'olvar-gateway'),
@@ -639,19 +661,39 @@ create table public.readings_hourly (
   humidity_pct_n  integer not null, humidity_pct_avg real,  humidity_pct_min real,  humidity_pct_max real,
   lux_n           integer not null, lux_avg real, lux_min real, lux_max real,
   soil_raw_n      integer not null, soil_raw_avg real, soil_raw_min smallint, soil_raw_max smallint,
-  primary key (device_id, bucket)
+  -- exact soil_raw distribution (distinct value → count), so soil % can be averaged AFTER per-sample clamping
+  -- under the CURRENT calibration (≈60 pairs/hour; a few hundred/day; ≈3 MB/year)
+  soil_raw_values smallint[] not null default '{}',             -- distinct soil_raw values, ascending
+  soil_raw_counts integer[]  not null default '{}',             -- same length; sum = soil_raw_n
+  primary key (device_id, bucket),
+  check (cardinality(soil_raw_values) = cardinality(soil_raw_counts))
 );
 -- readings_daily: same columns, `bucket date` = local date in plants.timezone (UTC if no plant).
--- Daily rows are computed DIRECTLY FROM RAW readings of that local date (raw exists for 90 d, so every late row can
--- still be folded in). That is exact for any timezone offset (incl. :30/:45). Combining hourly rows elsewhere must
--- use sum(<m>_avg * <m>_n) / nullif(sum(<m>_n), 0), never the total n.
--- readings_hourly_v / readings_daily_v (security_invoker): add soil_pct_avg = soil_pct(soil_raw_avg),
---   soil_pct_min = soil_pct(soil_raw_max), soil_pct_max = soil_pct(soil_raw_min)   (inverted: higher raw = drier)
+-- Unsealed daily rows are computed DIRECTLY FROM RAW readings of that local date. That is exact for any timezone
+-- offset (incl. :30/:45). Combining hourly rows elsewhere must use sum(<m>_avg * <m>_n) / nullif(sum(<m>_n), 0),
+-- never the total n.
+
+-- soil % of a bucket, exactly equal to the mean of the per-reading readings_v.soil_pct values:
+create function public.soil_pct_avg(vals smallint[], cnts integer[], dry_raw integer, wet_raw integer) returns real
+  language sql immutable parallel safe set search_path = '' as $$
+  select (sum(public.soil_pct(v, dry_raw, wet_raw) * c) / nullif(sum(c), 0))::real
+  from unnest(vals, cnts) as t(v, c) $$;
+-- readings_hourly_v / readings_daily_v (security_invoker):
+--   soil_pct_avg = soil_pct_avg(soil_raw_values, soil_raw_counts, dry, wet)      -- NOT soil_pct(soil_raw_avg)
+--   soil_pct_min = soil_pct(soil_raw_max), soil_pct_max = soil_pct(soil_raw_min) -- clamping is monotone, so exact
+--   (inverted: higher raw = drier). Example: dry=3000, wet=1000, raw {0, 3000} → per-reading 100 % and 0 % → avg 50 %.
 
 -- persisted watermark: the job resumes from where it last succeeded, however long it was down
 create table public.rollup_state (
   id boolean primary key default true check (id),              -- single row
   processed_until timestamptz not null default '-infinity'
+);
+-- archival boundary per device: every hourly/daily bucket that STARTS before sealed_before is SEALED,
+-- i.e. its raw rows may be (partly) deleted, so it is never recomputed from raw again
+create table public.rollup_seals (
+  device_id text primary key references public.devices(id) on delete cascade,
+  sealed_before timestamptz not null,
+  late_rows_ignored bigint not null default 0                   -- late arrivals that fell into sealed buckets
 );
 create function public.refresh_rollups() returns void
   language plpgsql security definer set search_path = '' as $$ … $$;
@@ -659,19 +701,32 @@ create function public.refresh_rollups() returns void
   -- 2. lo := processed_until - interval '10 minutes'  (overlap; recompute is idempotent)
   --    hi := now() - interval '2 minutes'           (lag: received_at = insert txn start, upload txns are short)
   -- 3. touched := distinct (device_id, hour) and (device_id, local date) of readings with received_at in (lo, hi]
-  -- 4. recompute those hourly + daily buckets from raw (upsert on PK)
-  -- 5. update rollup_state set processed_until = hi    -- same transaction: all-or-nothing
-create function public.rebuild_rollups(p_from timestamptz, p_to timestamptz) returns void …  -- manual repair
-revoke execute on function public.refresh_rollups(), public.rebuild_rollups(timestamptz, timestamptz)
-  from public, anon, authenticated;
-select cron.schedule('olvar-rollups', '5 * * * *', $$select public.refresh_rollups()$$);
--- retention never deletes rows that are not yet rolled up (if the job is down for > 90 d, raw rows are kept)
-select cron.schedule('olvar-retention', '30 3 * * *', $$
-  delete from public.readings
-  where recorded_at < now() - interval '90 days'
-    and received_at <= (select processed_until from public.rollup_state) $$);
+  -- 4. drop touched buckets whose start < rollup_seals.sealed_before (add their row count to late_rows_ignored);
+  --    a sealed summary is never overwritten by one recomputed from partially retained raw rows
+  -- 5. recompute the remaining (complete, unsealed) hourly + daily buckets from raw (upsert on PK)
+  -- 6. update rollup_state set processed_until = hi    -- same transaction: all-or-nothing
+create function public.apply_retention() returns void
+  language plpgsql security definer set search_path = '' as $$ … $$;
+  -- runs as one transaction, under the same advisory lock:
+  -- 1. perform refresh_rollups-equivalent catch-up, so every row about to be deleted is already summarised
+  -- 2. per device: cut := local midnight (plants.timezone, UTC if none) of (local today - 90 days),
+  --    floored to the UTC hour  → hour-aligned, so no hourly bucket straddles it; a local day straddling it starts
+  --    before it and is therefore sealed too
+  -- 3. upsert rollup_seals.sealed_before = greatest(existing, cut)   (never moves backwards)
+  -- 4. delete from readings where device_id = d and recorded_at < sealed_before
+create function public.rebuild_rollups(p_from timestamptz, p_to timestamptz) returns void …
+  -- manual repair; refuses (raises) for any bucket that starts before sealed_before
+revoke execute on function public.refresh_rollups(), public.apply_retention(),
+  public.rebuild_rollups(timestamptz, timestamptz) from public, anon, authenticated;
+select cron.schedule('olvar-rollups',   '5 * * * *',  $$select public.refresh_rollups()$$);
+select cron.schedule('olvar-retention', '30 3 * * *', $$select public.apply_retention()$$);
+-- Late-arrival policy: a reading whose bucket is already sealed (recorded > ~90 d ago) is inserted, is ignored by
+-- rollups (counted in late_rows_ignored), and is deleted by the next retention run. The gateway also dead-letters
+-- outbox rows whose recorded_at is older than 89 days ("beyond_retention") instead of uploading them.
+-- Timezone change: unsealed daily rows of the device are deleted and rebuilt from raw in the new timezone (trigger on
+-- plants.timezone → rebuild_rollups(sealed_before, now())); sealed daily rows keep their old-timezone dates.
 -- grants/RLS mirror readings (select to authenticated via devices.owner_id; all to service_role);
--- rollup_state: no grants to anon/authenticated
+-- rollup_state / rollup_seals: no grants to anon/authenticated
 
 -- ===== 20261116000300_status.sql =====
 -- effective_thresholds(plant_id) = profile.thresholds deep-merged per metric with plants.threshold_overrides
@@ -793,12 +848,12 @@ tests. Depending on what it touches, it must pass `uv run pytest`, `supabase tes
 
 | ID | Owner files | Depends on | Acceptance criteria | Verify (no hardware) |
 |---|---|---|---|---|
-| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Seed:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources), a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
-| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C in the review example), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. Retention deletes only rows > 90 d that are at or below the watermark. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
+| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Seed:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources), a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; `timezone` updates to `Asia/Seol`, `UTC+3` or `''` fail with 22023 and leave the row unchanged, while `Asia/Seoul` succeeds; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
+| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C in the review example), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. **Soil clamping:** with dry=3000, wet=1000 and raw {0, 3000}, `soil_pct_avg` = 50 %, which equals the mean of `readings_v.soil_pct` for the bucket; after a recalibration the two still agree. **Retention + late arrival:** a daily bucket built from temperatures {10, 30} (mean 20) is sealed by `apply_retention()`, which deletes the 10; a late reading of 30 is then inserted into that sealed day. The stored daily mean stays 20, the row is counted in `late_rows_ignored`, and the next retention run deletes it. `rebuild_rollups` refuses to touch sealed buckets. `sealed_before` is hour-aligned, never moves backwards, and is correct for a +05:30 timezone. A timezone change rebuilds only unsealed daily rows. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
 | **T3 Status view + offline periods** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status, labels and summary for every rule in §5.6, including `no_data`, `offline` (> 180 s), uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules. `device_offline_periods` returns: gaps > 180 s only; gaps clipped at the window edges; a gap spanning midnight in both days' results; `device_restart` when `boot_id` changes; `ongoing` for an open trailing gap; nothing for another owner's device (RLS); an error for a window > 7 days | Table-driven pgTAP with fixed `now()` via fixtures |
 | **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
 | **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
-| **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. The uploader handles 2xx, 5xx and network errors. **Classification:** a 401/403/`42501`/404/`PGRST*` response leaves every row queued with `last_error` set, and delivery resumes once the mock is fixed; a batch with one `23514` row dead-letters only that row (bisection). It sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
+| **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. Rows with `recorded_at` older than 89 days are dead-lettered as `beyond_retention`. The uploader handles 2xx, 5xx and network errors. **Classification:** a 401/403/`42501`/404/`PGRST*` response leaves every row queued with `last_error` set, and delivery resumes once the mock is fixed; a batch with one `23514` row dead-letters only that row (bisection). It sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
 | **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines. `python -m olvar_gateway status` prints the queue depth, dead-letter count and `last_error` | pytest with fakes; `python -m olvar_gateway --check-config` |
 | **T8 Fake device + E2E** | `tools/fake_esp32.py`, `dev/compose.yml`, `tests/e2e/**` | T7 | The fake device simulates a day/night lux curve, soil_raw drying and a watering jump (higher = drier), a reboot (new boot_id, seq reset), QoS 1 duplicates, garbage payloads, null sensors, `rssi_dbm`, and the LWT on SIGKILL. **E2E:** the happy path inserts N rows; Supabase down for 2 min loses nothing and creates no duplicates; a gateway restart loses nothing; a spoofed id is rejected; the LWT makes the device offline and `plant_status_v.overall = offline` | `docker compose -f dev/compose.yml up -d && supabase start && uv run pytest -m e2e` |
 | **T9 Pi deployment & setup** | `deploy/**`, `tools/setup_plant.py`, `docs/DEPLOY.md`, `docs/RUNBOOK.md` | T7 | `install.sh` is idempotent: apt packages, `olvar` user, venv, env file 0640, unit with `StateDirectory` and sandboxing, journald cap, nftables. `update.sh` checks out a tag, installs pinned dependencies and restarts. `setup_plant.py` creates the one plant and device (owner email → owner_id, timezone) and prints the `mosquitto_passwd` command | Debian Trixie arm64 container (`systemd-analyze verify`, `shellcheck`) |
@@ -871,7 +926,8 @@ retention, DeepSeek use, MQTT encryption, backups).
   - Models and prices change often [38], so `DEEPSEEK_MODEL` is configurable.
   - The daily cap of 200 admitted messages is enforced atomically. It bounds the cost at about $9/month, or $18/month
     if every call is retried.
-- **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration. If the probe is moved
+- **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration, including summaries
+  and sealed buckets, through the stored `soil_raw` distributions. If the probe is moved
   to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the
   upgrade path after v1.
 - **R7 Soil thresholds.** The 20/35/85/90% values are heuristics, because no extension source gives sensor
