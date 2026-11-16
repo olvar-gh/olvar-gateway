@@ -1,5 +1,13 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.119.0";
-import { type ChatRow, localDateWindow, type PlantContext, type Reading, type StatusRow, type SummaryRow } from "./context.ts";
+import {
+  type ChatRow,
+  hourlyWindowStart,
+  localDateWindow,
+  type PlantContext,
+  type Reading,
+  type StatusRow,
+  type SummaryRow,
+} from "./context.ts";
 import { AdmitError, type NewReply, type Store } from "./handler.ts";
 
 const SUMMARY_COLS = [
@@ -61,7 +69,7 @@ export class SupabaseStore implements Store {
     };
 
     const nowIso = now.toISOString();
-    const dayAgo = new Date(now.getTime() - 24 * 3_600_000).toISOString();
+    const hourlyFrom = hourlyWindowStart(now).toISOString();
     const [thresholds, statusRows, deviceRows] = await Promise.all([
       this.admin.rpc("effective_thresholds", { p_plant_id: plantId }).then((r) => check(r, "thresholds")),
       this.admin.from("plant_status_v").select("*").eq("plant_id", plantId).limit(1).then((r) => check(r, "status")),
@@ -81,7 +89,7 @@ export class SupabaseStore implements Store {
           .order("recorded_at", { ascending: false }).limit(1)
           .then((r) => check(r, "latest reading")),
         this.admin.from("readings_hourly_v").select(SUMMARY_COLS)
-          .eq("device_id", deviceId).gte("bucket", dayAgo).lte("bucket", nowIso)
+          .eq("device_id", deviceId).gte("bucket", hourlyFrom).lte("bucket", nowIso)
           .order("bucket").then((r) => check(r, "hourly")),
         this.admin.from("readings_daily_v").select(SUMMARY_COLS)
           .eq("device_id", deviceId).gte("bucket", week.from).lte("bucket", week.to).order("bucket")

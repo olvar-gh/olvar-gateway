@@ -180,16 +180,34 @@ function summaryLine(rows: SummaryRow[]): string {
     `soil ${aggText(s, " %", 0)}`;
 }
 
-// Four 6-hour blocks ending at `now`, so the prompt stays small (§2.7).
+const HOUR_MS = 3_600_000;
+
+function floorHour(t: number): number {
+  return Math.floor(t / HOUR_MS) * HOUR_MS;
+}
+
+// Hourly buckets hold a whole hour of readings, so edges sit on bucket starts: the first block starts at the bucket
+// that holds the reading from exactly 24 h ago and the last one runs to `now` (it also holds the current partial hour).
+export function hourlyBlockEdges(now: Date): number[] {
+  const t = now.getTime();
+  return [4, 3, 2, 1].map((i) => floorHour(t - i * 6 * HOUR_MS));
+}
+
+export function hourlyWindowStart(now: Date): Date {
+  return new Date(hourlyBlockEdges(now)[0]);
+}
+
+// Four blocks of about 6 hours, so the prompt stays small (§2.7).
 export function condenseHourly(rows: SummaryRow[], now: Date, timeZone: string): string[] {
+  const edges = [...hourlyBlockEdges(now), now.getTime()];
   const out: string[] = [];
-  const end = now.getTime();
-  for (let i = 3; i >= 0; i--) {
-    const from = end - (i + 1) * 6 * 3_600_000;
-    const to = end - i * 6 * 3_600_000;
+  for (let i = 0; i < 4; i++) {
+    const from = edges[i];
+    const to = edges[i + 1];
+    const last = i === 3;
     const block = rows.filter((r) => {
       const t = Date.parse(r.bucket);
-      return t >= from && t < to;
+      return t >= from && (last ? t <= to : t < to);
     });
     const label = `${localParts(new Date(from), timeZone).time}–${localParts(new Date(to), timeZone).time}`;
     out.push(`  ${label}: ${block.length ? summaryLine(block) : "no data"}`);

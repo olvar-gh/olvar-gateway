@@ -5,6 +5,7 @@ import {
   type ChatRow,
   condenseHourly,
   fallbackReply,
+  hourlyWindowStart,
   intlTimeZone,
   localDateWindow,
   type PlantContext,
@@ -189,7 +190,7 @@ Deno.test("condenseHourly: four 6 h blocks with n-weighted averages and overall 
   ];
   const blocks = condenseHourly(rows, NOW, "UTC");
   assertEquals(blocks.length, 4);
-  assertStringIncludes(blocks[3], "23:05–05:05");
+  assertStringIncludes(blocks[3], "23:00–05:05");
   assertStringIncludes(blocks[3], "temperature 19 °C / 21.5 °C / 27 °C");
   assertStringIncludes(blocks[0], "temperature 17 °C / 18 °C / 19 °C");
   assertStringIncludes(blocks[1], "no data");
@@ -232,4 +233,33 @@ Deno.test("context block: LAST 7 DAYS keeps only days inside the window, never o
 Deno.test("context block: an outage longer than a week shows no daily data instead of stale days", () => {
   const block = buildContextBlock(ctx({ daily: [summary("2026-10-01", 15), summary("2026-10-02", 16)] }));
   assertStringIncludes(block, "LAST 7 DAYS (daily min / avg / max):\n  no data");
+});
+
+Deno.test("condenseHourly: block edges sit on hourly bucket starts and cover every reading of the last 24 h", () => {
+  const blocks = condenseHourly([
+    summary("2026-11-15T04:00:00Z", 10),
+    summary("2026-11-15T05:00:00Z", 31),
+    summary("2026-11-15T10:00:00Z", 32),
+    summary("2026-11-15T11:00:00Z", 33),
+    summary("2026-11-15T22:00:00Z", 34),
+    summary("2026-11-15T23:00:00Z", 35),
+    summary("2026-11-16T05:00:00Z", 36),
+  ], NOW, "UTC");
+  assertEquals(blocks.map((b) => b.slice(2, 13)), ["05:00–11:00", "11:00–17:00", "17:00–23:00", "23:00–05:05"]);
+  assert(!blocks.some((b) => b.includes(" 9 °C") || b.includes("11 °C")), "a bucket that ended more than 24 h ago is left out");
+  assertStringIncludes(blocks[0], "temperature 30 °C / 31.5 °C / 33 °C");
+  assertStringIncludes(blocks[1], "temperature 32 °C / 33 °C / 34 °C");
+  assertStringIncludes(blocks[2], "temperature 33 °C / 34 °C / 35 °C");
+  assertStringIncludes(blocks[3], "temperature 34 °C / 35.5 °C / 37 °C");
+});
+
+Deno.test("condenseHourly: the bucket holding a reading from 23h35m ago and one from 5h35m ago are kept and placed", () => {
+  const blocks = condenseHourly([summary("2026-11-15T05:00:00Z", 37), summary("2026-11-15T23:00:00Z", 40)], NOW, "UTC");
+  assertStringIncludes(blocks[0], "37 °C");
+  assertStringIncludes(blocks[3], "40 °C");
+});
+
+Deno.test("hourlyWindowStart: the hourly query starts at the bucket containing now - 24 h", () => {
+  assertEquals(hourlyWindowStart(NOW).toISOString(), "2026-11-15T05:00:00.000Z");
+  assertEquals(hourlyWindowStart(new Date("2026-11-16T05:00:00Z")).toISOString(), "2026-11-15T05:00:00.000Z");
 });
