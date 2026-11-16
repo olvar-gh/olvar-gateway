@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets and local state
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+supabase/.temp/
+supabase/.branches/
+supabase/functions/.env
+supabase/functions/.env.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
