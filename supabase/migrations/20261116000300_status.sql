@@ -41,14 +41,18 @@ create function public.in_middle_half(v double precision, t jsonb) returns boole
 -- plant_status_v: the status pill, one row per plant the caller can see. Rules (thresholds in §2.8):
 --   no device or no reading ever → no_data; latest reading > 180 s old or device status 'offline' → offline;
 --   temperature / humidity: median of the last 30 min; humidity "high" only if every reading of the last 12 h is
---     above high and those readings reach back the full 12 h;
+--     above high and those readings cover the 12 h continuously (see "sustained" below);
 --   light: daytime (08:00–18:00 in plants.timezone) mean of the last 24 h for the low side; the max 10-min median of
 --     the last 24 h for the high side (high side wins when both apply at the same severity);
 --   soil: median soil_pct of the last 10 min (same formula as readings_v); unknown while uncalibrated; "high" only if
---     every reading of the last 48 h is above high and those readings reach back the full 48 h;
+--     every reading of the last 48 h is above high and those readings cover the 48 h continuously;
+--   sustained = first reading within 10 min of the window start, last within 15 min of now, and no gap > 15 min
+--     between consecutive readings (an outage gives no evidence for the persistence rules);
+--   critical_high (only via overrides for humidity / soil) has no persistence rule;
 --   any critical_* → in_trouble; any low/high → needs_attention; all known metrics ok and inside the middle half of
 --     their ok band → great; else okay. Unknown metrics never raise severity.
--- Only 'ntp'/'backfilled' readings count. Windows end at now(); computed_at = now().
+-- Only 'ntp'/'backfilled' readings at or before now() count (a future timestamp never hides an outage).
+-- Windows end at now(); computed_at = now().
 -- ---------------------------------------------------------------------------------------------------------------
 create view public.plant_status_v with (security_invoker = true) as
 with base as (
@@ -62,13 +66,13 @@ with base as (
 ),
 vals as (
   select b.*, lr.latest_reading_at,
-         t30.temp_med, t30.hum_med, h12.hum_min, h12.hum_first,
+         t30.temp_med, t30.hum_med, h12.hum_min, h12.hum_first, h12.hum_last, h12.hum_max_gap,
          l24.light_day_mean, l24.light_max_med,
-         s10.soil_med, s48.soil_min, s48.soil_first
+         s10.soil_med, s48.soil_min, s48.soil_first, s48.soil_last, s48.soil_max_gap
   from base b
   left join lateral (
     select max(r.recorded_at) as latest_reading_at from public.readings r
-    where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled')) lr on true
+    where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled') and r.recorded_at <= b.computed_at) lr on true
   left join lateral (
     select percentile_cont(0.5) within group (order by r.temperature_c) as temp_med,
            percentile_cont(0.5) within group (order by r.humidity_pct) as hum_med
@@ -76,10 +80,12 @@ vals as (
     where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled')
       and r.recorded_at > b.computed_at - interval '30 minutes' and r.recorded_at <= b.computed_at) t30 on true
   left join lateral (
-    select min(r.humidity_pct) as hum_min, min(r.recorded_at) as hum_first
-    from public.readings r
-    where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled') and r.humidity_pct is not null
-      and r.recorded_at > b.computed_at - interval '12 hours' and r.recorded_at <= b.computed_at) h12 on true
+    select min(x.humidity_pct) as hum_min, min(x.recorded_at) as hum_first, max(x.recorded_at) as hum_last,
+           max(x.gap) as hum_max_gap
+    from (select r.humidity_pct, r.recorded_at, r.recorded_at - lag(r.recorded_at) over (order by r.recorded_at) as gap
+          from public.readings r
+          where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled') and r.humidity_pct is not null
+            and r.recorded_at > b.computed_at - interval '12 hours' and r.recorded_at <= b.computed_at) x) h12 on true
   left join lateral (
     select avg(q.lux) filter (where q.local_hour between 8 and 17) as light_day_mean,
            (select max(m.med) from (
@@ -98,17 +104,21 @@ vals as (
     where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled')
       and r.recorded_at > b.computed_at - interval '10 minutes' and r.recorded_at <= b.computed_at) s10 on true
   left join lateral (
-    select min(public.soil_pct(r.soil_raw, b.soil_dry_raw, b.soil_wet_raw)) as soil_min, min(r.recorded_at) as soil_first
-    from public.readings r
-    where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled') and r.soil_raw is not null
-      and r.recorded_at > b.computed_at - interval '48 hours' and r.recorded_at <= b.computed_at) s48 on true
+    select min(public.soil_pct(x.soil_raw, b.soil_dry_raw, b.soil_wet_raw)) as soil_min, min(x.recorded_at) as soil_first,
+           max(x.recorded_at) as soil_last, max(x.gap) as soil_max_gap
+    from (select r.soil_raw, r.recorded_at, r.recorded_at - lag(r.recorded_at) over (order by r.recorded_at) as gap
+          from public.readings r
+          where r.device_id = b.device_id and r.clock_source in ('ntp', 'backfilled') and r.soil_raw is not null
+            and r.recorded_at > b.computed_at - interval '48 hours' and r.recorded_at <= b.computed_at) x) s48 on true
 ),
 st as (
   select v.*,
          public.threshold_status(v.temp_med, v.th -> 'temperature_c') as temperature_status,
          case when public.threshold_status(v.hum_med, v.th -> 'humidity_pct') = 'high'
                    and not (v.hum_min > (v.th #>> '{humidity_pct,high}')::double precision
-                            and v.hum_first <= v.computed_at - interval '12 hours' + interval '10 minutes')
+                            and v.hum_first <= v.computed_at - interval '12 hours' + interval '10 minutes'
+                            and v.hum_last >= v.computed_at - interval '15 minutes'
+                            and coalesce(v.hum_max_gap, interval '0') <= interval '15 minutes')
               then 'ok'
               else public.threshold_status(v.hum_med, v.th -> 'humidity_pct') end as humidity_status,
          case
@@ -122,7 +132,9 @@ st as (
            when not coalesce(v.soil_calibrated, false) then 'unknown'
            when public.threshold_status(v.soil_med, v.th -> 'soil_pct') = 'high'
                 and not (v.soil_min > (v.th #>> '{soil_pct,high}')::double precision
-                         and v.soil_first <= v.computed_at - interval '48 hours' + interval '10 minutes')
+                         and v.soil_first <= v.computed_at - interval '48 hours' + interval '10 minutes'
+                         and v.soil_last >= v.computed_at - interval '15 minutes'
+                         and coalesce(v.soil_max_gap, interval '0') <= interval '15 minutes')
              then 'ok'
            else public.threshold_status(v.soil_med, v.th -> 'soil_pct') end as soil_status
   from vals v
@@ -187,6 +199,7 @@ select o.plant_id, o.device_id, o.latest_reading_at, o.device_status, coalesce(o
            when 'soil:critical_low' then 'Soil is very dry — water now'
            when 'soil:low' then 'Soil is getting dry — water soon'
            when 'soil:high' then 'Soil has been soggy for 2 days — hold off watering'
+           when 'soil:critical_high' then 'Soil is waterlogged — stop watering and let it drain'
            when 'temperature:critical_low' then 'It''s far too cold — move somewhere warmer now'
            when 'temperature:low' then 'It''s a bit cold — keep away from drafts'
            when 'temperature:high' then 'It''s a bit warm — move somewhere cooler'
@@ -194,6 +207,7 @@ select o.plant_id, o.device_id, o.latest_reading_at, o.device_status, coalesce(o
            when 'humidity:critical_low' then 'The air is very dry — mist the leaves or use a humidifier'
            when 'humidity:low' then 'The air is a bit dry — leaf tips may brown'
            when 'humidity:high' then 'The air has been very humid for 12 hours — improve airflow'
+           when 'humidity:critical_high' then 'The air is far too humid — improve airflow now'
            when 'light:critical_low' then 'Far too dark — move closer to a window'
            when 'light:low' then 'Could use more light — try a brighter spot'
            when 'light:high' then 'Getting direct sun — move out of the sun'
@@ -208,7 +222,8 @@ from ov o;
 -- Uses the readings in [p_from, p_to] plus the last one before p_from and the first one after p_to, so gaps that
 -- cross the window edges are clipped to it (a gap across midnight appears in both days). A gap yields
 -- (prev + 60 s, next); cause is device_restart when boot_id changed across it. The trailing gap from the last
--- reading to least(now(), p_to) is ongoing. Only 'ntp'/'backfilled' rows. Window ≤ 7 days. Security invoker, so a
+-- reading is ongoing when now() is more than 180 s after that reading; it ends at least(now(), p_to) and is clipped
+-- like any other gap, so an outage that began just before p_to still shows in that window. Only 'ntp'/'backfilled' rows. Window ≤ 7 days. Security invoker, so a
 -- device the caller cannot see has no readings and returns nothing; so does a window beyond the 90-day retention.
 -- ---------------------------------------------------------------------------------------------------------------
 create function public.device_offline_periods(p_device_id text, p_from timestamptz, p_to timestamptz)
@@ -249,7 +264,7 @@ begin
     union all
     select s.recorded_at + interval '60 seconds', least(now(), p_to), 'no_data', true
     from seq s
-    where s.next_at is null and least(now(), p_to) - s.recorded_at > interval '180 seconds'
+    where s.next_at is null and now() - s.recorded_at > interval '180 seconds'
   )
   select greatest(g.g_start, p_from), least(g.g_end, p_to),
          extract(epoch from least(g.g_end, p_to) - greatest(g.g_start, p_from))::integer,

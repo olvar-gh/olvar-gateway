@@ -3,7 +3,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local timezone = 'UTC';
-select plan(58);
+select plan(66);
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Fixtures (as postgres): owner A with one plant per status scenario, owner B with one plant.
@@ -35,7 +35,15 @@ insert into fx values
   ('fresh-180',    'UTC',               true,  true,  'online',  true,  '180s', 23, 55, 3000, 0, 1800, '{}'),
   ('lwt',          'UTC',               true,  true,  'offline', true,  '0s',   23, 55, 3000, 0, 1800, '{}'),
   ('nodata',       'UTC',               true,  false, 'unknown', true,  '0s',   null, null, null, null, null, '{}'),
-  ('nodev',        'UTC',               false, false, null,      false, '0s',   null, null, null, null, null, '{}');
+  ('nodev',        'UTC',               false, false, null,      false, '0s',   null, null, null, null, null, '{}'),
+  -- readings for these are inserted by hand below
+  ('hum-sparse',   'UTC',               true,  false, 'online',  true,  '0s',   null, null, null, null, null, '{}'),
+  ('soil-sparse',  'UTC',               true,  false, 'online',  true,  '0s',   null, null, null, null, null, '{}'),
+  ('future',       'UTC',               true,  false, 'online',  true,  '0s',   null, null, null, null, null, '{}'),
+  ('hum-crit',     'UTC',               true,  false, 'online',  true,  '0s',   null, null, null, null, null,
+                   '{"humidity_pct": {"critical_high": 95}}'),
+  ('soil-crit',    'UTC',               true,  false, 'online',  true,  '0s',   null, null, null, null, null,
+                   '{"soil_pct": {"critical_high": 99}}');
 
 insert into public.plants (owner_id, profile_id, nickname, timezone, threshold_overrides)
 select '11111111-1111-4111-8111-111111111111', 'spathiphyllum', f.name, f.tz, f.overrides from fx f;
@@ -67,6 +75,19 @@ where device_id = 'st-sun'
 insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms, clock_source)
 values ('st-offline-old', now(), 'cafe0002', 0, 0, 'unsynced');
 
+-- sparse: only two very-high samples at the edges of the 12 h / 48 h window (an outage in between) are no evidence
+-- of a sustained high; future: a reading timestamped tomorrow must not hide that the newest real one is 5 min old;
+-- *-crit: critical_high exists only through overrides and has no persistence rule
+insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms, temperature_c, humidity_pct, soil_raw) values
+  ('st-hum-sparse',  now() - interval '11 hours 55 minutes', 'cafe0001', 0, 0, 23, 90, 1800),
+  ('st-hum-sparse',  now(),                                  'cafe0001', 1, 1, 23, 90, 1800),
+  ('st-soil-sparse', now() - interval '47 hours 55 minutes', 'cafe0001', 0, 0, 23, 55, 1100),
+  ('st-soil-sparse', now(),                                  'cafe0001', 1, 1, 23, 55, 1100),
+  ('st-future',      now() - interval '5 minutes',           'cafe0001', 0, 0, 23, 55, 1800),
+  ('st-future',      now() + interval '1 day',               'cafe0001', 1, 1, 23, 55, 1800),
+  ('st-hum-crit',    now(),                                  'cafe0001', 0, 0, 23, 96, 1800),
+  ('st-soil-crit',   now(),                                  'cafe0001', 0, 0, 23, 55, 1000);
+
 -- owner B
 insert into public.plants (id, owner_id, profile_id, nickname)
 values ('bbbbbbbb-0000-4000-8000-000000000001', '22222222-2222-4222-8222-222222222222', 'spathiphyllum', 'b-plant');
@@ -84,7 +105,11 @@ values ('st-b', now(), 'bbbb0001', 0, 0, 23);
 -- ---------------------------------------------------------------------------------------------------------------
 create temp table m as select date_trunc('day', now()) - interval '1 day' as m;
 
-insert into public.devices (id, owner_id, status) values ('gaps-a', '11111111-1111-4111-8111-111111111111', 'online');
+insert into public.devices (id, owner_id, status) values ('gaps-a', '11111111-1111-4111-8111-111111111111', 'online'),
+  ('gaps-b', '11111111-1111-4111-8111-111111111111', 'online');
+-- gaps-b: silent for the last 7 min (an ongoing outage)
+insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms)
+values ('gaps-b', now() - interval '7 minutes', 'b3b3b3b3', 0, 0);
 
 insert into public.readings (device_id, recorded_at, boot_id, seq, uptime_ms)
 select 'gaps-a', ts, boot, row_number() over (partition by boot order by ts) - 1, 0
@@ -153,7 +178,12 @@ insert into expected_status values
   ('fresh-180',   'great|ok|ok|ok|ok|{}'),
   ('lwt',         'offline|ok|ok|ok|ok|{}'),
   ('nodata',      'no_data|unknown|unknown|unknown|unknown|{}'),
-  ('nodev',       'no_data|unknown|unknown|unknown|unknown|{}');
+  ('nodev',       'no_data|unknown|unknown|unknown|unknown|{}'),
+  ('hum-sparse',  'okay|ok|ok|unknown|ok|{}'),
+  ('soil-sparse', 'okay|ok|ok|unknown|ok|{}'),
+  ('future',      'offline|ok|ok|unknown|ok|{}'),
+  ('hum-crit',    'in_trouble|ok|critical_high|unknown|ok|{humidity}'),
+  ('soil-crit',   'in_trouble|ok|ok|unknown|critical_high|{soil}');
 grant select on expected_status to authenticated;
 
 select is(concat_ws('|', s.overall, s.temperature_status, s.humidity_status, s.light_status, s.soil_status, s.issues::text),
@@ -177,7 +207,9 @@ insert into expected_text values
   ('soggy',     'Needs attention|Just right|Just right|Just right|Too wet|Soil has been soggy for 2 days — hold off watering'),
   ('override',  'Needs attention|A bit cold|Just right|Just right|Just right|It''s a bit cold — keep away from drafts'),
   ('lwt',       'Offline|Just right|Just right|Just right|Just right|No recent readings — check the sensor''s power and Wi-Fi'),
-  ('nodata',    'No data yet|No data|No data|No data|No data|Waiting for the first reading');
+  ('nodata',    'No data yet|No data|No data|No data|No data|Waiting for the first reading'),
+  ('hum-crit',  'In trouble|Just right|Too humid|No data|Just right|The air is far too humid — improve airflow now'),
+  ('soil-crit', 'In trouble|Just right|Just right|No data|Too wet|Soil is waterlogged — stop watering and let it drain');
 grant select on expected_text to authenticated;
 
 select is(concat_ws('|', s.overall_label, s.temperature_label, s.humidity_label, s.light_label, s.soil_label, s.summary),
@@ -187,7 +219,7 @@ join public.plants p on p.nickname = e.name
 join public.plant_status_v s on s.plant_id = p.id
 order by e.name;
 
-select is((select count(*)::int from public.plant_status_v), 18, 'owner sees one status row per own plant');
+select is((select count(*)::int from public.plant_status_v), 23, 'owner sees one status row per own plant');
 select ok((select bool_and(computed_at = now()) from public.plant_status_v), 'computed_at is now()');
 select is((select latest_reading_at from public.plant_status_v s join public.plants p on p.id = s.plant_id
            where p.nickname = 'offline-old'),
@@ -222,6 +254,11 @@ select results_eq(
            extract(epoch from now() - max(recorded_at) - interval '60 seconds')::integer, 'no_data', true
     from public.readings where device_id = 'gaps-a' and clock_source = 'ntp'$$,
   'an open trailing gap is ongoing and ends at now()');
+select results_eq(
+  $$select started_at, ended_at, duration_s, cause, ongoing
+    from public.device_offline_periods('gaps-b', now() - interval '1 hour', now() - interval '5 minutes')$$,
+  $$values (now() - interval '6 minutes', now() - interval '5 minutes', 60, 'no_data', true)$$,
+  'an ongoing outage that began < 180 s before p_to is still clipped into that window');
 select is((select count(*)::int from m, public.device_offline_periods('gaps-a', m.m - interval '150 minutes',
                                                                      m.m - interval '145 minutes')),
           0, 'a window with readings and no gap > 180 s returns nothing');
