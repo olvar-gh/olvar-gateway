@@ -5,6 +5,8 @@ import {
   type ChatRow,
   condenseHourly,
   fallbackReply,
+  intlTimeZone,
+  localDateWindow,
   type PlantContext,
   type StatusRow,
   type SummaryRow,
@@ -197,4 +199,37 @@ Deno.test("fallbackReply: deterministic and built from the status summary", () =
   assertEquals(fallbackReply(STATUS), fallbackReply(STATUS));
   assertStringIncludes(fallbackReply(STATUS), "Soil is getting dry — water soon");
   assert(fallbackReply(null).length > 0);
+});
+
+Deno.test("intlTimeZone: maps PostgreSQL-only zone names to ones Intl accepts", () => {
+  assertEquals(intlTimeZone("Asia/Seoul"), "Asia/Seoul");
+  assertEquals(intlTimeZone("posix/Asia/Seoul"), "Asia/Seoul");
+  assertEquals(intlTimeZone("right/Europe/Berlin"), "Europe/Berlin");
+  assertEquals(intlTimeZone("not/a-zone"), "UTC");
+});
+
+Deno.test("context block: a posix/ timezone from the database renders in that zone", () => {
+  const block = buildContextBlock(ctx({ timezone: "posix/Asia/Seoul" }));
+  assertStringIncludes(block, "LOCAL TIME: Monday 2026-11-16 14:05 (Asia/Seoul)");
+});
+
+Deno.test("localDateWindow: seven local days ending today in the plant timezone", () => {
+  assertEquals(localDateWindow(NOW, "Asia/Seoul", 7), { from: "2026-11-10", to: "2026-11-16" });
+  assertEquals(localDateWindow(new Date("2026-11-16T02:00:00Z"), "America/Los_Angeles", 7),
+    { from: "2026-11-09", to: "2026-11-15" });
+  assertEquals(localDateWindow(new Date("2026-03-03T12:00:00Z"), "UTC", 7), { from: "2026-02-25", to: "2026-03-03" });
+});
+
+Deno.test("context block: LAST 7 DAYS keeps only days inside the window, never older or future buckets", () => {
+  const block = buildContextBlock(ctx({
+    daily: [summary("2026-10-01", 15), summary("2026-11-09", 16), summary("2026-11-10", 17), summary("2026-11-16", 18),
+      summary("2026-11-17", 19)],
+  }));
+  const days = block.split("\n").filter((l) => /^ {2}\d{4}-\d{2}-\d{2}:/.test(l)).map((l) => l.slice(2, 12));
+  assertEquals(days, ["2026-11-10", "2026-11-16"]);
+});
+
+Deno.test("context block: an outage longer than a week shows no daily data instead of stale days", () => {
+  const block = buildContextBlock(ctx({ daily: [summary("2026-10-01", 15), summary("2026-10-02", 16)] }));
+  assertStringIncludes(block, "LAST 7 DAYS (daily min / avg / max):\n  no data");
 });

@@ -98,3 +98,29 @@ Deno.test("missing API key fails without calling DeepSeek", async () => {
   await assertRejects(() => chatCompletion({ ...cfg(s.f), apiKey: "" }, MSGS), DeepSeekError, "DEEPSEEK_API_KEY");
   assertEquals(s.bodies.length, 0);
 });
+
+Deno.test("timeout: a deadline that expires while reading the body stays a non-retried timeout", async () => {
+  let calls = 0;
+  const f: typeof fetch = (_input, init) => {
+    calls++;
+    return Promise.resolve(
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(" "));
+            init!.signal!.addEventListener("abort", () => controller.error(init!.signal!.reason), { once: true });
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } },
+      ),
+    );
+  };
+  const e = await assertRejects(() => completeWithRetry({ ...cfg(f), timeoutMs: 20 }, MSGS), DeepSeekError);
+  assertEquals([e.message, e.retryable, calls], ["timeout", false, 1]);
+});
+
+Deno.test("retry: a malformed body is still retried as invalid json", async () => {
+  const s = stubFetch([() => new Response("{not json", { status: 200 }), ok("fine")]);
+  assertEquals((await completeWithRetry(cfg(s.f), MSGS)).content, "fine");
+  assertEquals(s.bodies.length, 2);
+});

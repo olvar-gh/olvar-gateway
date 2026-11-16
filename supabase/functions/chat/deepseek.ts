@@ -40,6 +40,7 @@ export function deepSeekConfigFromEnv(env: { get(name: string): string | undefin
 export async function chatCompletion(cfg: DeepSeekConfig, messages: ChatTurn[]): Promise<Completion> {
   if (!cfg.apiKey) throw new DeepSeekError("DEEPSEEK_API_KEY is not set", false);
   const doFetch = cfg.fetch ?? fetch;
+  const signal = AbortSignal.timeout(cfg.timeoutMs);
   let res: Response;
   try {
     res = await doFetch(`${cfg.baseUrl}/chat/completions`, {
@@ -53,11 +54,10 @@ export async function chatCompletion(cfg: DeepSeekConfig, messages: ChatTurn[]):
         temperature: TEMPERATURE,
         stream: false,
       }),
-      signal: AbortSignal.timeout(cfg.timeoutMs),
+      signal,
     });
   } catch (e) {
-    const timedOut = e instanceof DOMException && e.name === "TimeoutError";
-    throw new DeepSeekError(timedOut ? "timeout" : `network: ${(e as Error).message}`, false);
+    throw new DeepSeekError(signal.aborted ? "timeout" : `network: ${(e as Error).message}`, false);
   }
 
   if (!res.ok) {
@@ -70,8 +70,15 @@ export async function chatCompletion(cfg: DeepSeekConfig, messages: ChatTurn[]):
     choices?: { message?: { content?: string | null } }[];
     usage?: { prompt_tokens?: number; completion_tokens?: number };
   };
+  let text: string;
   try {
-    data = await res.json();
+    text = await res.text();
+  } catch (e) {
+    // headers can arrive long before a non-streaming body, so the deadline may expire while reading it
+    throw new DeepSeekError(signal.aborted ? "timeout" : `network: ${(e as Error).message}`, false, res.status);
+  }
+  try {
+    data = JSON.parse(text);
   } catch {
     throw new DeepSeekError("invalid json", true, res.status);
   }

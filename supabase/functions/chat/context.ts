@@ -86,9 +86,26 @@ export function anchoredHistory(rows: ChatRow[], admitted: ChatRow, maxPairs = H
   return turns;
 }
 
+// plants.timezone is validated against pg_timezone_names, which also lists tzdata's posix/ and right/ copies and a
+// few names Intl rejects; map those to something Intl accepts instead of failing after the message was admitted.
+export function intlTimeZone(tz: string): string {
+  const accepts = (z: string) => {
+    try {
+      new Intl.DateTimeFormat("en-US", { timeZone: z });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (accepts(tz)) return tz;
+  const stripped = tz.replace(/^(posix|right)\//, "");
+  if (accepts(stripped)) return stripped;
+  return "UTC";
+}
+
 function localParts(d: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
+    timeZone: intlTimeZone(timeZone),
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -99,6 +116,17 @@ function localParts(d: Date, timeZone: string) {
   }).formatToParts(d);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
   return { date: `${get("year")}-${get("month")}-${get("day")}`, time: `${get("hour")}:${get("minute")}`, weekday: get("weekday") };
+}
+
+export function localDate(d: Date, timeZone: string): string {
+  return localParts(d, timeZone).date;
+}
+
+/** Inclusive local-date bounds of the `days` days ending today in `timeZone`. */
+export function localDateWindow(now: Date, timeZone: string, days: number): { from: string; to: string } {
+  const to = localDate(now, timeZone);
+  const from = new Date(Date.parse(`${to}T00:00:00Z`) - (days - 1) * 86_400_000).toISOString().slice(0, 10);
+  return { from, to };
 }
 
 export function localTime(d: Date, timeZone: string): string {
@@ -171,7 +199,7 @@ export function condenseHourly(rows: SummaryRow[], now: Date, timeZone: string):
 
 export function buildContextBlock(c: PlantContext): string {
   const lines: string[] = [];
-  lines.push(`LOCAL TIME: ${localTime(c.now, c.timezone)} (${c.timezone})`);
+  lines.push(`LOCAL TIME: ${localTime(c.now, c.timezone)} (${intlTimeZone(c.timezone)})`);
   lines.push(
     `PLANT: ${c.nickname}, ${c.commonName} (${c.scientificName})` + (c.location ? `, location: ${c.location}` : ""),
   );
@@ -204,7 +232,10 @@ export function buildContextBlock(c: PlantContext): string {
   lines.push(...condenseHourly(c.hourly, c.now, c.timezone));
 
   lines.push("LAST 7 DAYS (daily min / avg / max):");
-  const days = [...c.daily].sort((a, b) => a.bucket.localeCompare(b.bucket)).slice(-7);
+  const week = localDateWindow(c.now, c.timezone, 7);
+  const days = c.daily
+    .filter((d) => d.bucket >= week.from && d.bucket <= week.to)
+    .sort((a, b) => a.bucket.localeCompare(b.bucket));
   if (days.length === 0) lines.push("  no data");
   for (const d of days) lines.push(`  ${d.bucket}: ${summaryLine([d])}`);
 

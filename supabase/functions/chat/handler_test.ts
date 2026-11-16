@@ -24,11 +24,13 @@ class MemoryStore implements Store {
     return Promise.resolve(row);
   }
 
+  timezone = "UTC";
+
   loadContext(): Promise<Omit<PlantContext, "now">> {
     return Promise.resolve({
       nickname: "Lily",
       location: null,
-      timezone: "UTC",
+      timezone: this.timezone,
       commonName: "Peace lily",
       scientificName: "Spathiphyllum wallisii",
       careNotes: "Keep moist.",
@@ -301,5 +303,18 @@ Deno.test("store failure: unexpected errors become a 500 without leaking details
     store.loadContext = () => Promise.reject(new Error("db down"));
     const res = await post({ plant_id: PLANT, message: "hi" });
     assertEquals([res.status, await res.json()], [500, { error: "internal" }]);
+  });
+});
+
+Deno.test("timezone: a database-valid posix/ zone still gets a reply instead of a 500 after admission", async () => {
+  await withStub(async (s) => {
+    s.replies.push(answer("Annyeong!"));
+    const { store, post } = setup(s.url);
+    store.timezone = "posix/Asia/Seoul";
+    const res = await post({ plant_id: PLANT, message: "hi" });
+    assertEquals(res.status, 200);
+    assertEquals((await res.json()).reply.content, "Annyeong!");
+    assertEquals(store.rows.map((r) => r.role), ["user", "plant"]);
+    assertStringIncludes((s.bodies[0] as { messages: ChatTurn[] }).messages[1].content, "(Asia/Seoul)");
   });
 });

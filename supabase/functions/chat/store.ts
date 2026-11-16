@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from "npm:@supabase/supabase-js@2.119.0";
-import type { ChatRow, PlantContext, Reading, StatusRow, SummaryRow } from "./context.ts";
+import { type ChatRow, localDateWindow, type PlantContext, type Reading, type StatusRow, type SummaryRow } from "./context.ts";
 import { AdmitError, type NewReply, type Store } from "./handler.ts";
 
 const SUMMARY_COLS = [
@@ -72,6 +72,7 @@ export class SupabaseStore implements Store {
     let hourly: SummaryRow[] = [];
     let daily: SummaryRow[] = [];
     const deviceId = (deviceRows as { id: string }[])[0]?.id;
+    const week = localDateWindow(now, plant.timezone, 7);
     if (deviceId) {
       const [l, h, d] = await Promise.all([
         this.admin.from("readings_v")
@@ -83,7 +84,7 @@ export class SupabaseStore implements Store {
           .eq("device_id", deviceId).gte("bucket", dayAgo).lte("bucket", nowIso)
           .order("bucket").then((r) => check(r, "hourly")),
         this.admin.from("readings_daily_v").select(SUMMARY_COLS)
-          .eq("device_id", deviceId).order("bucket", { ascending: false }).limit(7)
+          .eq("device_id", deviceId).gte("bucket", week.from).lte("bucket", week.to).order("bucket")
           .then((r) => check(r, "daily")),
       ]);
       latest = (l as Reading[])[0] ?? null;
