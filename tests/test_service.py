@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from olvar_gateway.buffer import Outbox
 from olvar_gateway.clock import Clock
 from olvar_gateway.mqtt_client import CLIENT_ID, MqttClient
 from olvar_gateway.service import HEARTBEAT_S, Service
-from olvar_gateway.uploader import SupabaseWriter, Uploader
+from olvar_gateway.uploader import SupabaseWriter
 
 URL = "http://supabase.test"
 KEY = "sb_secret_test_key_value"
@@ -126,15 +127,33 @@ def test_logs_are_json_lines():
 class FakePostgrest:
     def __init__(self) -> None:
         self.requests: list[tuple[str, object]] = []
-        self.attempts: list[str] = []
+        self.attempts: list[tuple[float, str]] = []
         self.status = 201
+        self.down_paths: set[str] = set()
+        self.devices: set[str] | None = None
+        self.clock: FakeTime | None = None
+        self.delay_s = 0.0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.attempts.append(request.url.path)
-        if self.status >= 300:
-            return httpx.Response(self.status, json={"message": "down"})
-        self.requests.append((request.url.path, json.loads(request.content)))
+        path = request.url.path
+        self.attempts.append((self.clock.now if self.clock else 0.0, path))
+        if self.delay_s:
+            time.sleep(self.delay_s)
+        if self.status >= 300 or path in self.down_paths:
+            return httpx.Response(self.status if self.status >= 300 else 503, json={})
+        body = json.loads(request.content)
+        if self.devices is not None:
+            if path == "/rest/v1/devices":
+                self.devices.add(body["id"])
+            elif path == "/rest/v1/readings" and any(
+                r["device_id"] not in self.devices for r in body
+            ):
+                return httpx.Response(400, json={"code": "23503", "message": "fk violation"})
+        self.requests.append((path, body))
         return httpx.Response(201)
+
+    def paths(self) -> list[str]:
+        return [p for _, p in self.attempts]
 
     def bodies(self, path: str) -> list:
         return [body for p, body in self.requests if p == path]
@@ -178,13 +197,12 @@ def make_service(tmp_path, server, fake_time, sync_flag):
         writer = SupabaseWriter(
             URL, KEY, httpx.Client(transport=httpx.MockTransport(server)), now=lambda: T0
         )
-        uploader = Uploader(outbox, writer, clock, rng=lambda: 1.0)
         service = Service(
             outbox=outbox,
             writer=writer,
             clock=clock,
             gateway_id="olvar-gw",
-            uploader=uploader,
+            rng=lambda: 1.0,
             monotonic=fake_time,
             sleep=fake_time.sleep,
             **kwargs,
@@ -299,11 +317,11 @@ def test_cleared_retained_status_is_ignored(make_service, server):
     assert server.bodies("/rest/v1/devices") == []
 
 
-def test_device_update_is_retried_after_failure(make_service, server):
+def test_device_update_is_retried_after_failure(make_service, server, fake_time):
     service = make_service()
     service.handle_message(STATUS_TOPIC, b"offline")
     server.status = 503
-    service.tick()
+    fake_time.now += service.tick()
     service.handle_message(TOPIC, telemetry(1))
     server.status = 201
     service.tick()
@@ -381,11 +399,17 @@ def test_new_rows_do_not_cut_backoff_short(tmp_path, server, sync_flag):
     server.status = 503
     service.handle_message(TOPIC, telemetry(0))
     service.start()
-    assert wait_for(lambda: "/rest/v1/readings" in server.attempts)
+
+    def delivery_attempts() -> int:
+        return sum(p != "/rest/v1/gateways" for p in server.paths())
+
+    assert wait_for(lambda: delivery_attempts() > 0)
+    time.sleep(0.05)
+    before = delivery_attempts()
     for seq in range(1, 6):
         service.handle_message(TOPIC, telemetry(seq))
         time.sleep(0.02)
-    assert server.attempts.count("/rest/v1/readings") == 1
+    assert delivery_attempts() == before
     server.status = 201
     service.stop(flush_timeout=5.0)
     assert sum(len(b) for b in server.bodies("/rest/v1/readings")) == 6
@@ -599,3 +623,84 @@ def test_service_process_end_to_end_and_sigterm(broker, tmp_path):
     lines = [json.loads(line) for line in out.splitlines()]
     assert any(line["msg"] == "received SIGTERM, shutting down" for line in lines)
     assert lines[-1]["msg"] == "gateway stopped"
+
+
+def test_readings_wait_for_their_device_instead_of_dead_lettering(make_service, server, fake_time):
+    server.devices = set()
+    server.down_paths = {"/rest/v1/devices"}
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1))
+    for _ in range(3):
+        fake_time.now += service.tick()
+    assert server.bodies("/rest/v1/readings") == []
+    assert service._outbox.dead_letter_count() == 0
+    assert service._outbox.depth() == 1
+    server.down_paths = set()
+    fake_time.now += service.tick()
+    assert DEVICE in server.devices
+    assert [r["seq"] for r in server.bodies("/rest/v1/readings")[0]] == [1]
+    assert service._outbox.dead_letter_count() == 0
+
+
+def test_rows_left_by_an_earlier_run_create_their_device_first(make_service, server):
+    server.devices = set()
+    server.down_paths = {"/rest/v1/devices", "/rest/v1/readings"}
+    first = make_service()
+    first.handle_message(TOPIC, telemetry(1))
+    first.tick()
+    first._outbox.close()
+    server.down_paths = set()
+    second = make_service()
+    second.tick()
+    assert second._outbox.depth() == 0
+    assert second._outbox.dead_letter_count() == 0
+    assert server.bodies("/rest/v1/devices") == [{"id": DEVICE}]
+    assert len(server.bodies("/rest/v1/readings")) == 1
+
+
+def test_deleted_device_is_recreated_not_dead_lettered(make_service, server, fake_time):
+    server.devices = set()
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1))
+    fake_time.now += service.tick()
+    server.devices.clear()
+    service.handle_message(TOPIC, telemetry(2))
+    service._pending.clear()
+    fake_time.now += service.tick()
+    assert service._outbox.dead_letter_count() == 0
+    assert service._outbox.depth() == 1
+    fake_time.now += service.tick()
+    assert service._outbox.depth() == 0
+    assert service._outbox.dead_letter_count() == 0
+
+
+def test_heartbeat_retries_do_not_shorten_readings_backoff(make_service, server, fake_time):
+    server.clock = fake_time
+    server.down_paths = {"/rest/v1/readings", "/rest/v1/gateways"}
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1))
+    start = fake_time.now
+    while fake_time.now - start < 1500:
+        fake_time.now += max(service.tick(), 0.001)
+    times = [t - start for t, p in server.attempts if p == "/rest/v1/readings"]
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    assert gaps == sorted(gaps)
+    assert gaps[-1] == 300
+    assert len([p for _, p in server.attempts if p == "/rest/v1/gateways"]) >= 20
+
+
+def test_flush_never_overruns_its_deadline_on_a_hung_supabase(tmp_path, server, sync_flag):
+    clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
+    outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
+    writer = SupabaseWriter(URL, KEY, httpx.Client(transport=httpx.MockTransport(server)))
+    service = Service(outbox=outbox, writer=writer, clock=clock, gateway_id="gw")
+    for seq in range(3):
+        service.handle_message(TOPIC, telemetry(seq))
+    service.handle_message("olvar/v1/olvar-d4e5f6/status", b"online")
+    server.delay_s = 2.0
+    started = time.monotonic()
+    service.stop(flush_timeout=0.5)
+    assert time.monotonic() - started < 1.5
+    reopened = Outbox(tmp_path / "outbox.db", now=lambda: T0)
+    assert reopened.depth() == 3
+    reopened.close()
