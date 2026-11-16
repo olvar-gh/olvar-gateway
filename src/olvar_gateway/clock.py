@@ -57,10 +57,11 @@ class Clock:
         return self._sync_flag.exists()
 
     def now(self) -> Stamp:
+        # Check the flag first: a sync landing mid-sample then yields an unsynced stamp (held
+        # and backfilled) instead of pre-correction wall time marked as trusted.
+        synced = self.synced()
         mono = self._mono_ns()
-        return Stamp(
-            wall=self._wall(), mono_ns=mono, pi_boot_id=self._boot_id, synced=self.synced()
-        )
+        return Stamp(wall=self._wall(), mono_ns=mono, pi_boot_id=self._boot_id, synced=synced)
 
     def backfill(self, mono_ns: int, pi_boot_id: str) -> datetime | None:
         """Wall time of an earlier monotonic stamp, or None if not synced or from another boot."""

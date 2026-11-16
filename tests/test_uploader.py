@@ -296,3 +296,14 @@ def test_heartbeat_auth_failure_is_retryable(server, writer):
     result = writer.heartbeat("olvar-gw", "0.1.0", 0)
     assert result.outcome == "retryable"
     assert result.error_class == "auth"
+
+
+def test_backoff_stays_capped_after_very_long_outage(server, outbox, uploader):
+    fill(outbox, 1)
+    server.fail = (503, None)
+    uploader._failures = 5000  # days of failures: 2**5000 would overflow a float
+    assert uploader.step() == BACKOFF_MAX_S
+    assert outbox.depth() == 1
+    server.fail = None
+    assert uploader.step() == IDLE_DELAY_S
+    assert outbox.depth() == 0

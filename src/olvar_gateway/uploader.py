@@ -245,7 +245,8 @@ class Uploader:
         return self._failures > 0
 
     def _backoff(self) -> float:
-        base = min(BACKOFF_MAX_S, BACKOFF_MIN_S * 2 ** (self._failures - 1))
+        exponent = min(self._failures - 1, 16)  # 2**16 s is already past the cap; avoids overflow
+        base = min(BACKOFF_MAX_S, BACKOFF_MIN_S * 2**exponent)
         return max(BACKOFF_MIN_S, base * (0.5 + 0.5 * self._rng()))
 
     def step(self) -> float:

@@ -62,3 +62,16 @@ def test_read_boot_id(tmp_path):
     assert read_boot_id(path) == "5c1e0d8e-1111-4222-8333-944455556666"
     fallback = read_boot_id(tmp_path / "missing")
     assert fallback.startswith("proc-")
+
+
+def test_sync_during_sampling_yields_unsynced_stamp(tmp_path):
+    flag = tmp_path / "synchronized"
+
+    def wall_then_sync():
+        flag.touch()  # first NTP sync lands right after the stale wall time is read
+        return T0
+
+    clock = Clock(sync_flag=flag, boot_id="boot-a", wall=wall_then_sync, mono_ns=lambda: 1)
+    stamp = clock.now()
+    assert not stamp.synced
+    assert clock.now().synced
