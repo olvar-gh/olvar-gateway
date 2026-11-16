@@ -1,9 +1,14 @@
-# olvar-gateway — Project plan
+# olvar-gateway — Project plan (v1, final contract)
 
-Scope of this repo: the Raspberry Pi gateway service (MQTT → validate → durable buffer → Supabase), the Mosquitto
-broker configuration, the Pi deployment, **and** everything that lives in Supabase (schema, migrations, RLS, cron
-jobs, the avatar Edge Function, generated types). Firmware and dashboard have their own plans; this document
-states which parts of the shared contract it relies on and where it proposes changes.
+Scope of this repo:
+- the Raspberry Pi gateway service (MQTT → validate → durable buffer → Supabase);
+- the Mosquitto broker configuration;
+- the Pi deployment;
+- everything that lives in Supabase: schema, migrations, RLS, cron jobs, the derived plant status, the `chat` Edge
+  Function, and the generated TypeScript types.
+
+Firmware and dashboard have their own plans. §4 records the final cross-repo contract as the user decided it on
+2026-11-16. Where this plan differed from that contract, the contract wins.
 
 Research date: 2026-11-16. Numbers in brackets like [3] point to the sources list in §2.11.
 
@@ -11,163 +16,190 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
 
 ## 1. Summary
 
-- **Runtime:** Python 3.13 (the version that ships with Raspberry Pi OS Trixie) running as a **systemd** service on
-  **Raspberry Pi OS Lite 64-bit (Trixie)**. Libraries: `paho-mqtt` 2.x, `httpx`, `pydantic` 2. The service does not use
-  `supabase-py`: it calls PostgREST directly with the **secret key** (`sb_secret_…`) sent in the `apikey` header.
-- **Broker:** Mosquitto 2.x from apt, listening on the LAN at 1883. Anonymous access is off, each device has its
-  own username and password (**username = device_id**), and an ACL file means a device can only publish to its own
-  topics.
-- **Durability:** every valid message first goes into a **SQLite outbox** (WAL mode, `synchronous=FULL`). An uploader
-  then sends it to Supabase as an idempotent upsert keyed on `(device_id, boot_id, seq)`. Retries back off
-  exponentially, and malformed or rejected rows go to a dead-letter table.
-- **Volume:** one device at 60 s is 1,440 rows a day, about 0.3 MB/day with indexes (estimate). That is roughly
-  115 MB a year, so the 500 MB Free-plan database holds it comfortably. pg_cron jobs build **hourly** and **daily
-  rollups** for the charts, and raw rows are deleted after **90 days** (open question Q3).
-- **Supabase:** only the **publishable/secret** keys are used, because the legacy `anon`/`service_role` keys are
-  deprecated by the end of 2026 [8]. Every migration contains **explicit GRANTs**, because new tables are no longer
-  exposed to the Data API automatically [11]. RLS is single-owner: the dashboard **requires sign-in**, public
-  sign-ups are disabled, and rows are visible only to `devices.owner_id` / `plants.owner_id`.
-- **Avatar:** a **Supabase Edge Function `avatar-tick`, triggered every 15 min by pg_cron**, not the Pi. A
-  deterministic rules engine (using the peace-lily thresholds in §2.8) decides `mood` and `expression`. DeepSeek
-  `deepseek-flash` (non-thinking mode, JSON output) only writes the first-person `message` and the `advice` text.
-  The model is called only when the plant's state changes or the last message is more than 3 h old. Worst case is
-  about **$2.4/month**; the typical cost is well under $0.50/month (§2.7).
-- **"Avatar" in practice:** DeepSeek is a text model. The avatar is a set of pre-drawn expression sprites in the
-  dashboard, chosen by the `expression` enum, plus an LLM-written speech bubble and advice cards.
-- **Testing without hardware:** a fake ESP32 publisher (`tools/fake_esp32.py`), a local Mosquitto in Docker,
-  `supabase start` for the full local stack, pgTAP tests for RLS and rollups, `deno test` with a DeepSeek stub, and
-  pytest for the gateway.
+- **v1 product:**
+  - Sign-in with a single owner and owner-only RLS.
+  - Screens: Home, Sensors, Timeline, Chat, Soil calibration, Settings/Account.
+  - One plant and one device, created by a setup script.
+  - Multi-plant support, pairing, notifications, care log, export, OTA and the other non-v1 items are out of scope.
+    The schema contains only what v1 needs.
+- **Runtime:** Python 3.13 (the version that ships with Raspberry Pi OS Trixie) runs as a **systemd** service on
+  **Raspberry Pi OS Lite 64-bit (Trixie)**. Libraries: `paho-mqtt` 2.x, `httpx` and `pydantic` 2. The service does not
+  use `supabase-py`; it calls PostgREST directly with a **secret key** (`sb_secret_…`) in the `apikey` header.
+- **Broker:** Mosquitto 2.x from apt, unencrypted on the LAN on port 1883.
+  - Anonymous access is off.
+  - Each device has its own username and password, and the username is the `device_id`.
+  - An ACL means a device can publish only to its own topics.
+- **Durability:** every valid message first goes into a **SQLite outbox**. An uploader then sends it to Supabase as
+  an idempotent upsert keyed on `(device_id, boot_id, seq)`. The ESP32 drops readings while the broker is
+  unreachable; the Pi keeps buffering while Supabase is unreachable.
+- **Soil calibration is stored in the database.** The Soil calibration screen writes `devices.soil_dry_raw` and
+  `soil_wet_raw`. The database computes **`soil_pct` at read time** with a single SQL function, exposed through
+  views. Recalibrating therefore re-expresses the whole history with the new calibration, and nothing is rewritten.
+  Until the device is calibrated, `soil_pct` is null.
+- **Status pill:** "Feeling great" and the other labels come from **deterministic threshold rules in one place**, the
+  SQL view `plant_status_v`. The dashboard and the chat function both read it. No LLM is involved.
+- **Chat with your plant:**
+  - The Supabase Edge Function **`chat`** is called by the signed-in owner.
+  - It stores the user's message.
+  - It gives DeepSeek **`deepseek-flash`** (thinking off) a context of plant profile, thresholds, `plant_status_v`,
+    the latest reading, 24 h and 7 d summaries, and the last 20 messages.
+  - It stores the reply and returns it. The plant answers in first person, in the language of the user's message.
+  - The DeepSeek key exists only in Edge Function secrets.
+  - Cost is about **$0.002 per message** at peak price.
+- **Data volume and retention:** 1,440 readings a day is about 0.3 MB/day. Raw readings are kept for **90 days**;
+  **hourly and daily summaries** are built by pg_cron.
+- **Keys:** only the new publishable and secret keys are used. Grants are explicit in every migration. There are no
+  off-site backups.
+- **Testing without hardware:**
+  - a fake ESP32 publisher;
+  - Mosquitto in Docker;
+  - `supabase start` for the full local stack;
+  - pgTAP for RLS, the status rules and rollups;
+  - `deno test` with a DeepSeek stub;
+  - pytest for the gateway.
 
 ---
 
 ## 2. Research findings (with sources)
 
 ### 2.1 Raspberry Pi 3B and OS
-- The current Raspberry Pi OS is a port of **Debian 13 "Trixie"** with kernel 6.18 (release of 6 Oct 2026). The **64-bit
-  image lists the Pi 3B as compatible**, and a "Legacy" Bookworm image still exists [1].
-- Lite (no desktop) is the edition meant for headless servers [2]. Trixie ships **Python 3.13**, and system Python is
-  "externally managed", so packages have to go into a venv [3][2].
-- The 64-bit OS uses more RAM. Phoronix measured **196 MB versus 103 MB** at idle [4], and one Pi 3B user reported about
-  20% more memory for the same workload [5]. On a headless 1 GB Pi with two small services this is acceptable, and
-  64-bit gets standard `aarch64` manylinux wheels from PyPI (`pydantic-core`, for example).
-- The Pi has **no RTC**. `systemd-timesyncd` saves the clock to disk and creates **`/run/systemd/timesync/synchronized`**
-  after each successful NTP sync [6]. Without a network at boot, the clock is wrong (it is restored from the last
-  saved time) [7]. The gateway has to detect this before it stamps any time (§5.4).
-- SD-card writes: Raspberry Pi's own resilience whitepaper recommends reducing writes and capping journald, for example
-  with a `journald.conf.d` drop-in [24]. SQLite in WAL mode with `synchronous=NORMAL` can roll back the last
-  transaction on power loss. `FULL` is durable [25]. At one write per minute, `FULL` costs nothing that matters.
+- Raspberry Pi OS is now based on **Debian 13 "Trixie"** with kernel 6.18 (release of 6 Oct 2026). The **64-bit image
+  lists the Pi 3B as compatible**. A "Legacy" Bookworm image still exists [1].
+- The Lite edition, with no desktop, is intended for headless servers [2].
+- Trixie ships **Python 3.13**. System Python is "externally managed", so the service uses a venv [3][2].
+- The 64-bit OS uses more RAM: Phoronix measured 196 MB versus 103 MB at idle [4], and a Pi 3B user reported about 20%
+  more [5]. That is fine on a headless 1 GB Pi, and 64-bit gets standard aarch64 wheels from PyPI.
+- **The Pi has no RTC.**
+  - `systemd-timesyncd` saves the clock to disk and touches **`/run/systemd/timesync/synchronized`** after each
+    successful sync [6].
+  - If the Pi boots without a network, the clock is wrong: it is restored from the last saved time [7].
+  - The gateway therefore must not stamp time until the clock is synced (§5.4).
+- **SD-card writes:** reduce writes and cap journald with a drop-in config [24]. In WAL mode,
+  `synchronous=NORMAL` can lose the last transaction on power loss; `FULL` is durable [25].
 
 ### 2.2 Mosquitto
-- Since Mosquitto 2.0 authentication has to be configured explicitly, and `allow_anonymous` defaults to `false` once a
-  listener is defined [12][13].
-- `password_file` is managed with `mosquitto_passwd` (argon2id hashes by default) [14]. In `acl_file`,
-  `pattern write olvar/v1/%u/...` replaces `%u` with the username [13]. When an ACL file is set, anything it does not
-  allow is denied [15].
-- The Debian package's main config already enables persistence and includes `conf.d/*.conf`. Settings such as
-  `persistence_location` must not be repeated in `conf.d`, or Mosquitto refuses to start [15].
-- Without TLS, MQTT credentials travel in clear text [15]. This is an accepted risk on a home LAN (§3, Q6).
-- Firmware note: the common Arduino `PubSubClient` library **can only publish QoS 0** [26]. To get QoS 1 the firmware
-  needs ESP-IDF `esp-mqtt` or another client.
+- Since 2.0, authentication must be configured explicitly. `allow_anonymous` defaults to false once a listener is
+  defined [12][13].
+- `mosquitto_passwd` manages the password file, with argon2id by default [14].
+- The ACL `pattern` rules substitute `%u` with the username [13]. With an ACL file set, anything not allowed is
+  denied [15].
+- The Debian main config already enables persistence and includes `conf.d`. Repeating settings such as
+  `persistence_location` there stops the broker from starting [15].
+- Without TLS, credentials travel in clear text [15]. The user accepts this on the home LAN.
+- The common Arduino `PubSubClient` can only publish QoS 0 [26]. The contract requires QoS 1, so firmware needs
+  `esp-mqtt` or an equivalent client.
 
 ### 2.3 Python libraries
-- `paho-mqtt` 2.2.0 (Nov 2026). The 2.x line **requires `CallbackAPIVersion.VERSION2`** in the constructor, and the
-  callback signatures changed from 1.x [16][17].
-- `supabase` (supabase-py) 2.34.1 needs Python ≥ 3.11 [18]. It brings auth, realtime and storage clients the gateway does
-  not need, so the gateway uses `httpx` against PostgREST directly.
-- PostgREST bulk upsert: `POST /rest/v1/readings?on_conflict=device_id,boot_id,seq` with
-  `Prefer: resolution=ignore-duplicates` sends one INSERT … ON CONFLICT DO NOTHING per batch [19]. The Python client
-  exposes the same thing as `ignore_duplicates`/`on_conflict` [20].
+- `paho-mqtt` 2.2.0 requires `CallbackAPIVersion.VERSION2`, and its callback signatures differ from 1.x [16][17].
+- `supabase-py` 2.34.1 pulls in auth, realtime and storage clients the gateway does not need [18].
+- PostgREST supports bulk upsert with `?on_conflict=…` and `Prefer: resolution=ignore-duplicates`, which runs as a
+  single INSERT … ON CONFLICT DO NOTHING [19][20].
 
-### 2.4 Supabase keys, grants, RLS, Realtime
-- There are four key types. **Publishable** (`sb_publishable_…`) is safe to ship in an app and runs as
-  `anon`/`authenticated` under RLS. **Secret** (`sb_secret_…`) is for backends only and bypasses RLS.
-  **`anon`/`service_role` are legacy and deprecated by the end of 2026** [8][9]. You can create several named secret
-  keys and rotate them independently [9][10].
-- Secret keys return **HTTP 401 when used from a browser** (matched on User-Agent) [9]. Supabase's examples send them
-  in the **`apikey` header** [21].
-- **Breaking change:** new tables in `public` are **not exposed to the Data API by default**. This became the default
-  for new projects from 30 May 2026 and is being applied to existing projects from 30 Oct 2026. You need explicit
-  `GRANT … TO anon/authenticated/service_role`, and a missing grant returns `42501` [11]. The grants apply to
-  `service_role` too [11].
-- RLS performance: name the role in the `to` clause, wrap `auth.uid()` as `(select auth.uid())`, index the columns
-  policies filter on, and avoid joins in policies by using `col in (select …)` [22][23].
-- Realtime `postgres_changes`: the table must be in the `supabase_realtime` publication, and RLS decides which
-  INSERT/UPDATE events a subscriber receives. DELETE events are not filtered by RLS [27][28].
-- Free plan: 500 MB database (read-only at 95% of the fixed 2 GB disk), **paused after 7 days of low activity**, no
-  backups, 500k Edge Function invocations, 2M Realtime messages, 200 concurrent Realtime connections, and unlimited API
-  requests [29][30][31].
-- Edge Functions: 150 s wall clock on Free, 2 s CPU per request, 256 MB memory [32]. They are scheduled with
-  **pg_cron + pg_net**, with the URL and secret key stored in **Vault**. A function called with a secret key needs
-  `verify_jwt = false` and `withSupabase({ auth: 'secret' })` from `npm:@supabase/server@1` [21][33].
-  `SUPABASE_URL` and `SUPABASE_SECRET_KEYS` are injected automatically [34].
-- The `timescaledb` extension is **deprecated on Postgres 17**, so the plan uses plain tables, pg_cron and rollup
-  tables instead of hypertables [35].
-- Local development: `supabase start` (Docker, about 7 GB RAM recommended), `supabase db reset` (applies migrations and
-  seed), `supabase test db` (pgTAP), `supabase gen types --lang typescript`, and
-  `supabase functions serve --env-file` [36][37].
+### 2.4 Supabase keys, grants, RLS, Realtime, Edge Functions
+- **Key types:**
+  - The **publishable** key (`sb_publishable_…`) runs as `anon`/`authenticated` under RLS.
+  - A **secret** key (`sb_secret_…`) bypasses RLS and is for backends only.
+  - The legacy **`anon`/`service_role` keys are deprecated by the end of 2026** [8][9].
+  - You can create **named secret keys** and rotate each one independently [9][10].
+  - Secret keys return 401 when called from a browser [9]. The examples send them in the `apikey` header [21].
+- **New tables in `public` are not exposed to the Data API automatically.** This has been the default for new projects
+  since 30 May 2026 and is applied to existing projects from 30 Oct 2026. Every role needs an explicit `GRANT`,
+  `service_role` included. A missing grant returns error `42501` [11].
+- **RLS performance:**
+  - name the role in each policy (`to authenticated`);
+  - wrap the user id as `(select auth.uid())`;
+  - index the columns policies filter on;
+  - write `col in (select …)` rather than joins [22][23].
+- **Realtime `postgres_changes`:**
+  - It delivers row changes from **tables** that are in the `supabase_realtime` publication [27].
+  - RLS decides which INSERT and UPDATE events a subscriber receives [28].
+  - Clients therefore treat a `readings` INSERT event as a signal and re-read the computed row from the view (§5.6).
+- **Free-plan limits:**
+  - 500 MB database;
+  - the project **pauses after 7 days of low activity**;
+  - no backups;
+  - 500k Edge Function invocations;
+  - 2M Realtime messages;
+  - 200 concurrent Realtime connections;
+  - unlimited API requests [29][30][31].
+- **Edge Function limits:** 150 s wall clock on the Free plan, **2 s CPU per request**, and 256 MB of memory [32].
+  Waiting on DeepSeek's response is async I/O and does not count toward the CPU limit.
+- **Edge Function authentication** [33]:
+  - Functions can require a **user JWT**, which is the default behaviour (`verify_jwt`).
+  - The `@supabase/server` `withSupabase` wrapper provides per-request clients.
+  - `SUPABASE_URL` and `SUPABASE_SECRET_KEYS` are injected into the function environment [34].
+  - Other secrets are set with `supabase secrets set` and, for local development, `supabase/functions/.env` [34].
+- **No TimescaleDB:** the `timescaledb` extension is deprecated on Postgres 17 [35]. The plan uses plain tables,
+  pg_cron and rollup tables instead.
+- **Local development tooling** [36][37]:
+  - `supabase start` runs the local stack in Docker and needs about 7 GB of RAM;
+  - `supabase db reset` re-applies migrations and seed data;
+  - `supabase test db` runs pgTAP tests;
+  - `supabase gen types --lang typescript` generates the types;
+  - `supabase functions serve --env-file` runs Edge Functions locally.
 
 ### 2.5 DeepSeek API (verified 2026-11-16)
-- **The model id is exactly `deepseek-flash`.** It currently serves **DeepSeek-V4.1-Flash-1017** (upgraded on 17 Oct 2026,
-  "pricing unchanged"). The legacy names `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` still work but are routed
-  to the same model. The other model is `deepseek-v4-pro` [38][39][40].
-- Base URL `https://api.deepseek.com` (OpenAI format). An Anthropic-format endpoint is at `/anthropic` [39][40].
-- **Pricing per 1M tokens for `deepseek-flash`:** input cache hit $0.003 off-peak / $0.006 peak; input cache miss
-  $0.15 / $0.30; output $0.60 / $1.20. **Peak** is 01:00–04:00 and 06:00–10:00 UTC on weekdays, and every other hour is
-  billed at half price [39].
-- **Thinking mode is ON by default.** Disable it with `{"thinking": {"type": "disabled"}}`. In thinking mode
-  `temperature` is ignored [41].
-- **JSON Output:** set `response_format: {type: "json_object"}`, include the word "json" and an example in the prompt,
-  and set `max_tokens`. **The content can come back blank (only spaces)** even with `finish_reason=stop`, so you have to
-  retry or fall back [42][43].
-- Rate limits are concurrency-based: 2,500 concurrent requests for flash, and **HTTP 429** above that [44]. That limit is
-  irrelevant at this project's load.
-- DeepSeek lists **Vision as image *input*** and has no image generation [39]. So "avatar" means text plus
-  dashboard-side art (§3).
+- **The model id is exactly `deepseek-flash`.**
+  - It currently serves DeepSeek-V4.1-Flash-1017 [38][39][40].
+  - The legacy names `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are routed to it.
+  - The other model is `deepseek-v4-pro`.
+- The base URL is `https://api.deepseek.com` (OpenAI-compatible format) [40].
+- **`deepseek-flash` prices per 1M tokens:**
 
-### 2.6 Volume and Free-plan budget (estimates; verify after 1 week with `pg_total_relation_size`)
+  | | Off-peak | Peak |
+  |---|---|---|
+  | Input, cache hit | $0.003 | $0.006 |
+  | Input, cache miss | $0.15 | $0.30 |
+  | Output | $0.60 | $1.20 |
+
+  Peak hours are 01:00–04:00 and 06:00–10:00 UTC on weekdays. All other hours are billed at half price [39].
+- **Thinking mode is on by default.** Disable it with `{"thinking": {"type": "disabled"}}`. In thinking mode,
+  `temperature` is ignored [41].
+- JSON Output mode exists but can return blank content [42][43]. Chat replies are plain text, so `chat` does not use
+  JSON mode.
+- Rate limiting is by concurrency: 2,500 concurrent requests for flash, then **HTTP 429** [44].
+
+### 2.6 Volume and Free-plan budget (estimates; check after 1 week with `pg_total_relation_size`)
 | Item | Per day | Per year | Free limit |
 |---|---|---|---|
-| Raw readings (1 device × 60 s) | 1,440 rows ≈ 0.3 MB incl. 3 indexes | ≈ 115 MB | 500 MB DB |
-| Raw kept 90 days | — | ≈ 28 MB steady state | |
-| Hourly rollups | 24 rows | ≈ 2 MB | |
-| PostgREST requests (1 upsert/msg + heartbeat) | ≈ 1,700 | — | unlimited [29] |
-| Realtime messages (2 open dashboards) | ≈ 3,000 | ≈ 90k/month | 2M/month [30] |
-| Edge Function invocations (cron 15 min) | 96 | ≈ 2.9k/month | 500k/month |
+| Raw readings (1 device × 60 s) | 1,440 rows ≈ 0.3 MB incl. indexes | ≈ 110 MB (90-day steady state ≈ 27 MB) | 500 MB DB |
+| Hourly + daily rollups | 25 rows | ≈ 2 MB | |
+| PostgREST writes (1/reading + heartbeat) | ≈ 1,700 | — | unlimited [29] |
+| Realtime messages (2 open clients) | ≈ 3,000 | ≈ 90k/month | 2M/month [30] |
+| `chat` invocations | user-driven, capped at 200/day (§5.7) | — | 500k/month |
 
-Row-size basis: about 24 B tuple header, about 100 B of columns, a 4 B item pointer, and three b-tree entries. Treat
-the numbers as ±50%.
-
-### 2.7 DeepSeek cost estimate
-- One call is about 1,100 input tokens (≈ 800 of them a static, cacheable system prompt and ≈ 300 the plant data)
-  plus at most 250 output tokens.
-- **Worst case:** 96 calls a day, no cache hits, all at peak prices. That is 3.2M input tokens × $0.30 + 0.72M output
-  tokens × $1.20, about **$1.82/month**. Allowing ±30% for longer prompts, budget **≤ $2.40/month**.
-- **Expected:** the model is called only when the state changes or after 3 h, so about 15–25 calls a day, most of
-  them off-peak and with cache hits on the system prompt. That comes to **about $0.10–0.40/month**. DeepSeek is
-  prepaid, so a $2 top-up covers months.
+### 2.7 DeepSeek cost per chat message
+- **Tokens per call:**
+  - a static system prompt of about 700 tokens (a cacheable prefix);
+  - plant context of about 1,200 tokens;
+  - history of the last 20 messages, about 1,600 tokens;
+  - the user's message;
+  - total about **3,600 input tokens**, plus at most **350 output tokens**.
+- **Worst case at peak with no cache hits:**
+  3,600 × $0.30/M + 350 × $1.20/M ≈ **$0.0015 per message**.
+- **Monthly estimates:**
+  - At 30 messages a day, about **$1.4/month** at worst. Off-peak hours and cache hits make it less.
+  - At the hard cap of 200 messages a day, at most about **$9/month**.
 
 ### 2.8 Peace lily (Spathiphyllum) care thresholds
-The sources are university extension services. 1 fc = 10.764 lux.
+Sources are university extension services. 1 fc = 10.764 lux.
 
-| Variable | Evidence | Proposed thresholds used by the rules engine |
+| Variable | Evidence | Thresholds used by `plant_status_v` |
 |---|---|---|
-| Temperature | Days 68–85 °F (20–29.4 °C), nights about 10 °F cooler; avoid < 60 °F (15.6 °C) [45][46]. 40–60 °F slows growth; damage after extended periods < 40 °F [46]. Chilling injury from 45 °F (7.2 °C) in some cultivars; growth delayed after 5 days at 52 °F (11.1 °C); keep ≤ 90 °F (32.2 °C) [47]. Preferred 75–85 °F, growth reduced ≤ 50 °F [48]. | critical_low < 10 °C · low < 16 °C · ok 18–29 °C · high > 30 °C · critical_high > 32 °C (evaluated on the 30-min median) |
-| Humidity | Brown tips from low humidity [46][49]. Indoor RH < 20% is low, 40–50% medium, > 50% high [50]. Tropical houseplants do best > 50% [51]. 40–60% is best for most plants and hard to reach indoors [52]. | critical_low < 25% · low < 40% · ok 40–70% · high > 85% sustained 12 h (fungal-risk heuristic, low confidence) |
-| Light | Bright indirect light, no direct sun [45][48]. Low-light plants need at least 25 fc (≈ 270 lx), and 75–200 fc (≈ 800–2,150 lx) is preferred [50][51]. Peace lily *adapts* to low light but **needs medium light (250–1,000 fc) to flower** [53]. Over 1,000 fc (≈ 10.8 klx) means direct indoor sun [54]. Leaf burn above 2,500 fc (≈ 27 klx) even in production [47]. | Evaluated on the **daytime mean** (08:00–18:00 local, last 24 h), not on single readings: critical_low < 270 lx · low < 800 lx · ok 800–5,400 lx · high if any 10-min median > 10,800 lx · critical_high > 27,000 lx |
-| Soil moisture | "Keep moist but not soggy, allow to dry slightly between waterings"; overwatering causes root rot; wilting when too dry [45][49][48]. No extension source gives a sensor percentage. Capacitive probe readings are **relative and vary by unit and soil**, so each probe must be calibrated [55][56][57]. | Heuristic on calibrated `soil_pct`: critical_low < 20 · low < 35 · ok 35–85 · high > 90 for 48 h. **Tune per plant** (Q5) |
+| Temperature | Days 68–85 °F (20–29.4 °C) and nights about 10 °F cooler; avoid < 60 °F (15.6 °C) [45][46]. 40–60 °F slows growth, and long periods < 40 °F cause damage [46]. Some cultivars show chilling injury from 45 °F (7.2 °C), and growth is delayed after 5 days at 52 °F (11.1 °C). Keep ≤ 90 °F (32.2 °C) [47]. Preferred 75–85 °F, with growth reduced at ≤ 50 °F [48]. | critical_low < 10 °C · low < 16 °C · ok 18–29 °C · high > 30 °C · critical_high > 32 °C. Uses the median of the last 30 min |
+| Humidity | Low humidity causes brown leaf tips [46][49]. Indoor RH < 20% is low, 40–50% medium, > 50% high [50]. Tropical houseplants prefer > 50% [51]. 40–60% is best and hard to reach indoors [52]. | critical_low < 25% · low < 40% · ok 40–70% · high > 85% sustained for 12 h (low confidence) |
+| Light | Bright indirect light, no direct sun [45][48]. Low-light plants need at least 25 fc (≈ 270 lx); 75–200 fc (≈ 800–2,150 lx) is preferred [50][51]. Medium light (250–1,000 fc) is needed **to flower** [53]. More than 1,000 fc (≈ 10.8 klx) means direct indoor sun [54]. Leaves burn above 2,500 fc (≈ 27 klx) [47]. | Uses the **daytime mean** (08:00–18:00 in `plants.timezone`, last 24 h): critical_low < 270 lx · low < 800 lx · ok 800–5,400 lx. Uses the max 10-min median: high > 10,800 lx · critical_high > 27,000 lx |
+| Soil moisture | "Keep moist, not soggy; let it dry slightly between waterings." Overwatering causes root rot; too dry causes wilting [45][48][49]. Capacitive readings are relative and vary by unit and soil, so each probe needs its own calibration [55][56][57]. | Applied to calibrated `soil_pct`: critical_low < 20 · low < 35 · ok 35–85 · high > 90 for 48 h. These are heuristics, editable through `plants.threshold_overrides`. Status is `unknown` until the device is calibrated |
 
-The thresholds are stored as data (`plant_profiles.thresholds`, with per-plant `threshold_overrides`), so tuning them
-needs no deploy.
-
-### 2.9 Capacitive soil sensor (affects `soil_pct` meaning)
-- Output voltage falls as moisture rises, at roughly 2.3–3.0 V dry and 1.0–1.5 V wet depending on the unit. The ESP32
-  ADC needs 11/12 dB attenuation to read the full range [55][57].
-- Air-versus-water calibration is a functional check. A better calibration uses the real pot: record the reading when
-  the soil is "dry enough to water" and again after a thorough watering has drained [56].
+### 2.9 Capacitive soil sensor
+- Output voltage **falls as moisture rises** (roughly 2.3–3.0 V dry and 1.0–1.5 V wet). The ESP32 needs 11/12 dB
+  attenuation to read that range [55][57]. This matches contract item C ("higher = drier").
+- Calibrating in air and in a glass of water is only a functional check. A better calibration uses the real pot:
+  record the reading when the soil is "dry enough to water", and again after a full watering has drained [56].
 
 ### 2.10 Deployment
-- A systemd unit with `EnvironmentFile=`, `Restart=on-failure` and sandboxing (`ProtectSystem=strict`,
-  `ReadWritePaths`, `NoNewPrivileges`) is the standard way to run a Python app in a venv without Docker [58].
+- systemd with `EnvironmentFile=`, restart on failure and sandboxing is the standard way to run a Python app from a
+  venv without Docker [58].
 
 ### 2.11 Sources
 1. Raspberry Pi OS downloads — https://www.raspberrypi.org/software/operating-systems
@@ -190,7 +222,7 @@ needs no deploy.
 18. supabase on PyPI — https://pypi.org/project/supabase
 19. PostgREST tables/views (bulk insert, upsert) — https://docs.postgrest.org/en/latest/references/api/tables_views.html
 20. Supabase Python upsert — https://supabase.com/docs/reference/python/upsert
-21. Scheduling Edge Functions — https://supabase.com/docs/guides/functions/schedule-functions
+21. Scheduling Edge Functions (apikey header usage) — https://supabase.com/docs/guides/functions/schedule-functions
 22. Supabase RLS — https://supabase.com/docs/guides/database/postgres/row-level-security
 23. RLS performance — https://supabase.com/docs/guides/database/postgres/row-level-security-performance
 24. Raspberry Pi whitepaper "Making a more resilient file system" — https://pip-assets.raspberrypi.com/categories/685-app-notes-guides-whitepapers/documents/RP-003610-WP-3-Making%20a%20more%20resilient%20file%20system.pdf
@@ -202,7 +234,7 @@ needs no deploy.
 30. Realtime limits — https://supabase.com/docs/guides/realtime/limits
 31. Free-plan disk and read-only behaviour (summarising Supabase docs) — https://fastero.com/blog/supabase-pricing
 32. Edge Function limits — https://supabase.com/docs/guides/functions/limits
-33. Securing Edge Functions (service-to-service) — https://supabase.com/docs/guides/functions/auth
+33. Securing Edge Functions — https://supabase.com/docs/guides/functions/auth
 34. Edge Function secrets/env — https://supabase.com/docs/guides/functions/secrets
 35. timescaledb deprecation — https://supabase.com/docs/guides/database/extensions/timescaledb
 36. Supabase CLI reference — https://supabase.com/docs/reference/cli/introduction
@@ -235,84 +267,94 @@ needs no deploy.
 
 | # | Decision | Why | Rejected alternatives |
 |---|---|---|---|
-| D1 | **Raspberry Pi OS Lite 64-bit (Trixie)** | It is the officially supported image for the 3B, has no desktop RAM cost, and gets standard aarch64 wheels [1][2] | 32-bit (saves RAM, but fewer prebuilt wheels, and nothing here is RAM-bound); Legacy Bookworm (older; only for compatibility needs) |
-| D2 | **Python 3.13 + paho-mqtt 2 + httpx + pydantic 2** | The system interpreter is already on the Pi; the code is readable for a student or novice project; pytest makes testing easy; about 40 MB RSS | **Go**: about 10 MB and a static binary, but less approachable and validation is more manual. **Node**: heavier (~60 MB) and gains nothing here. **supabase-py**: pulls in unused realtime, auth and storage dependencies |
-| D3 | **Threaded paho (loop_start) + an uploader thread**, not asyncio | Two simple threads with a SQLite queue between them; paho handles reconnects | aiomqtt/asyncio: fine, but adds concepts for no gain at 1 msg/min |
-| D4 | **systemd + apt Mosquitto**, no Docker on the Pi | Docker adds RAM, SD writes and image pulls on a 1 GB/SD-card machine; there are only two services | Docker Compose (it is used on the **dev machine** for Mosquitto instead) |
-| D5 | **SQLite outbox, upload by idempotent upsert** | Survives restarts and power loss; "at-least-once" delivery plus a DB unique key gives exactly one row per reading | Upload straight from the callback (loses data offline); a file-based queue (no atomic ack) |
-| D6 | **Gateway stamps `recorded_at`, but only from an NTP-synced clock** (§5.4) | The ESP32 has no clock, and the Pi has no RTC [6][7] | Trusting the Pi clock at all times (wrong timestamps after an offline boot) |
-| D7 | **Avatar job = Supabase Edge Function + pg_cron (every 15 min)** | It keeps working while the Pi is down (it can show "offline"); the DeepSeek key lives in Supabase secrets, not on an SD card; it is testable with `supabase functions serve`; the Pi stays lean | Running it in the Pi service: one less component, but it couples the LLM to the Pi's uptime and puts another secret on the Pi |
-| D8 | **Rules decide the state; the LLM writes only the words** | Deterministic, testable, and still works when DeepSeek fails or returns blank JSON [42]; prevents the model from inventing the plant's state | LLM decides the mood (non-deterministic, hard to test) |
-| D9 | **`deepseek-flash`, thinking disabled, JSON mode, max_tokens 400** | Cheapest model; reasoning tokens are billed as output and add nothing to a 2-sentence message [39][41] | `deepseek-v4-pro` (4× the price, no benefit here) |
-| D10 | **Avatar = sprite set chosen by `expression` + LLM speech bubble** | DeepSeek does not generate images [39] | Generating images (needs another provider; costly) |
-| D11 | **Dashboard requires sign-in; single owner via `owner_id`; sign-ups disabled** | Plant data is low-sensitivity, but a public read policy (`using (true)`) exposes it to anyone with the URL [22]; owner scoping costs little | Public read-only dashboard (Q1); anonymous sign-ins |
-| D12 | **Plain tables + pg_cron rollups**, no TimescaleDB | timescaledb is deprecated on PG17 [35] | Hypertables/continuous aggregates; materialized views (a full refresh rescans everything) |
-| D13 | **Plain MQTT on the LAN (1883) + passwords + ACL + firewall restricted to the LAN subnet** | ESP32 TLS means certificate pinning and rotation work for a home LAN; accepted risk [15] | TLS on 8883 (documented as a later hardening step, Q6) |
-| D14 | **`postgres_changes` for Realtime** | It is enough at 1 insert/min, and RLS is applied automatically [27] | Broadcast from DB triggers (scales better, but adds triggers and channel authorization) |
-| D15 | **Lock files: `uv` on dev, `uv export` → hashed `requirements.txt` → `pip` in a venv on the Pi** | No extra tool needed on the Pi; reproducible installs | Installing uv on the Pi (fine, but unnecessary) |
+| D1 | **Raspberry Pi OS Lite 64-bit (Trixie)** | Officially supported on the 3B; no desktop RAM cost; standard aarch64 wheels [1][2] | 32-bit (fewer prebuilt wheels); Legacy Bookworm |
+| D2 | **Python 3.13 + paho-mqtt 2 + httpx + pydantic 2** | The interpreter is already on the Pi; readable code; easy to test; about 40 MB RSS | Go (lower memory but less approachable); Node (heavier); supabase-py (unneeded dependencies) |
+| D3 | **Threaded paho (`loop_start`) + one uploader thread** | Two simple threads with a SQLite queue between them; paho handles reconnects | asyncio/aiomqtt (extra concepts, no gain at 1 msg/min) |
+| D4 | **systemd + Mosquitto from apt, no Docker on the Pi** | Saves RAM and SD writes on a 1 GB / SD-card machine | Docker Compose on the Pi (used on the dev machine only) |
+| D5 | **SQLite outbox + idempotent upsert** | Survives restarts and power loss. At-least-once delivery plus a unique key gives one row per reading | Uploading from the MQTT callback (loses data when offline) |
+| D6 | **Gateway stamps `recorded_at`, but only from an NTP-synced clock** (§5.4) | The ESP32 has no clock and the Pi has no RTC [6][7] | Always trusting the Pi clock |
+| D7 | **`soil_pct` is computed in the database at read time** by `public.soil_pct(raw, dry, wet)` and exposed through `security_invoker` views. Only `soil_raw` is stored | One formula in one place. Recalibration takes effect immediately, including history and rollups, without rewriting rows. Before calibration the value is null | **Gateway computes on insert**: the gateway would need the calibration, and recalibrating would leave stale values or need a mass UPDATE that floods Realtime. **Trigger plus stored column**: same recalibration problem. **Per-calibration history applied by `recorded_at`**: more correct if the probe moves, but out of v1 scope (see R6) |
+| D8 | **Status pill = SQL view `plant_status_v`** (deterministic, no LLM) | Every client and the chat function read the same values. Testable with pgTAP | Client-side rules (clients could disagree); LLM-generated mood (contract A forbids it) |
+| D9 | **Chat = Edge Function `chat`**, non-streaming, `deepseek-flash` with thinking disabled, plain text output | The key stays server-side. A reply of ≤ 350 tokens arrives in a few seconds | Streaming (possible later); calling DeepSeek from the client (would expose the key); JSON mode (blank-output risk [42], not needed) |
+| D10 | **Language follows the user's message** (instruction in the system prompt) | Contract A; no locale setting needed | A per-plant locale column |
+| D11 | **Plain tables + pg_cron rollups** | timescaledb is deprecated on PG17 [35] | Hypertables; materialized views |
+| D12 | **Realtime INSERT on `readings` acts as a signal; clients re-read from `readings_v`** | Realtime streams tables, not views [27], and `soil_pct` exists only in the views. This costs one small query per minute | Storing `soil_pct` (rejected in D7); client-side `soil_pct` math (two places) |
+| D13 | **Lock files:** `uv` on the dev machine, `uv export` → hashed `requirements.txt` → `pip` in a venv on the Pi | No extra tool needed on the Pi | Installing uv on the Pi |
 
 ---
 
-## 4. Contract changes
+## 4. Contract changes (final contract, decided 2026-11-16)
 
-These are changes to the provisional cross-repo contract. Clarifications that do not change behaviour are marked
-*(clarification)*.
+These items replace the provisional contract. My first plan proposed `avatar_states`, an `expression` enum, a
+periodic `avatar-tick` job, a firmware-side `soil_pct` and a per-plant locale. **All of these are dropped.**
 
-**C1 — Add `boot_id` to the telemetry payload (firmware).**
-`"boot_id": string`, 8 lowercase hex characters, generated randomly once per boot (e.g. `esp_random()`).
-*Why:* `seq` and `uptime_ms` restart from 0 after every reboot, so `(device_id, seq)` cannot be used for
-deduplication. `(device_id, boot_id, seq)` is unique across reboots and is the database's unique key. It makes MQTT
-QoS 1 redelivery and gateway retries harmless.
-
-**C2 — Sensor fields are nullable (firmware).** `temperature_c`, `humidity_pct`, `lux`, `soil_raw` and `soil_pct` may be
-`null` when that sensor's read fails. `NaN` and `Infinity` are forbidden because they are invalid JSON.
-*Why:* one failed I²C sensor should not drop the other readings. The gateway also sets a field to null when it is
-outside its physical range and logs the event.
-
-**C3 — `readings` gets more columns (dashboard: types).** The table is now
-`readings(id, device_id, recorded_at, received_at, boot_id, seq, uptime_ms, temperature_c, humidity_pct, lux,
-soil_raw, soil_pct, clock_source)` with `unique(device_id, boot_id, seq)`. Firmware version moves to `devices.fw`.
-New tables: `plant_profiles`, `plants`, `devices`, `readings_hourly`, `readings_daily`, `gateways` (§5.6).
-*Why:* deduplication, auditing of clock quality, and chart performance.
-
-**C4 — Device identity and MQTT auth (firmware) *(clarification)*.** The MQTT **username equals `device_id`**
-(`^[a-z0-9][a-z0-9-]{2,31}$`), each device has its own password, and the client id equals `device_id`. The ACL allows a
-device to write **only** `olvar/v1/<its username>/telemetry` and `/status`. The gateway rejects any message where the
-payload `device_id` differs from the topic segment. `olvar-gateway` is reserved as a device id.
-
-**C5 — QoS and status semantics (firmware) *(clarification)*.** Telemetry is published with **QoS 1, not retained**.
-Status is published retained with QoS 1 as the plain strings `online` (right after connecting) and `offline` (as the
-last will). Firmware should use a client that supports QoS 1 publishing (ESP-IDF `esp-mqtt`; `PubSubClient` is QoS 0
-only [26]). The gateway accepts QoS 0, but loses messages while it restarts.
-
-**C6 — Max payload 1 KiB, UTF-8 JSON object, unknown keys ignored (firmware) *(clarification)*.** This lets firmware add
-fields without breaking the gateway.
-
-**C7 — Avatar location and shape (dashboard).** The avatar job is an **Edge Function `avatar-tick` scheduled by
-pg_cron**, as decided in D7. The `avatar_states` row is
-`{id, plant_id, created_at, based_on_reading_at, mood, expression, message, advice[], metric_status{}, source, model,
-prompt_version, state_signature}` (§5.6). `expression` is an enum the dashboard maps to its own sprites:
-`happy | content | thirsty | soggy | cold | hot | gloomy | sunburnt | dry_air | sleepy | offline`.
-`mood` is one of `thriving | ok | needs_attention | in_trouble | offline`.
-
-**C8 — Dashboard auth and reads (dashboard).** The dashboard **signs in** (Supabase Auth, email+password or OTP, with a
-single owner account created by hand). All reads go through RLS by owner; nothing is granted to `anon`. Charts read
-`readings` for windows up to 48 h, `readings_hourly` up to 90 days, and `readings_daily` beyond that. Realtime
-subscriptions are on `readings` (INSERT, filter `device_id=eq.<id>`), `avatar_states` (INSERT, filter
-`plant_id=eq.<id>`) and `devices` (UPDATE, for online/offline).
-
-**C9 — Generated types location (dashboard).** `supabase/types/database.types.ts` is committed in **olvar-gateway**, is
-regenerated in CI on every migration change, and the dashboard copies or fetches it at a pinned commit.
-
-**C10 — Secret key header (gateway-internal) *(clarification)*.** The gateway sends `apikey: sb_secret_…` and does not
-send it as `Authorization: Bearer` [9][21]. It uses a dedicated named secret key, `gateway`, so that key can be rotated
-without touching the Edge Function's `default` key.
-
-Example v1 telemetry (also stored in `contracts/examples/valid-full.json`):
+**Telemetry.** Topic `olvar/v1/<device_id>/telemetry`, QoS 1, not retained. The payload is a UTF-8 JSON object of at
+most 1 KiB:
 ```json
-{"device_id":"lily-01","boot_id":"3fa9c2e1","seq":42,"uptime_ms":2520113,
- "temperature_c":23.4,"humidity_pct":48.2,"lux":1520.0,"soil_raw":2214,"soil_pct":61.5,"fw":"0.1.0"}
+{"device_id":"olvar-a1b2c3","boot_id":"3fa9c2e1","seq":42,"uptime_ms":2520113,
+ "temperature_c":23.4,"humidity_pct":48.2,"lux":1520.0,"soil_raw":2214,"rssi_dbm":-61,"fw":"0.1.0"}
 ```
+
+| Field | Rule |
+|---|---|
+| `device_id` | Defaults to `"olvar-"` + the last 6 hex characters of the MAC, in lowercase. The gateway accepts `^[a-z0-9][a-z0-9-]{2,31}$` and requires it to equal the topic segment. `olvar-gateway` is reserved |
+| `boot_id` | 8 random lowercase hex characters, generated once per boot |
+| `seq` | Restarts at 0 on each boot. `(device_id, boot_id, seq)` identifies a reading for deduplication |
+| `uptime_ms` | Integer ≥ 0 |
+| `temperature_c`, `humidity_pct`, `lux` | Number, or `null` when that sensor's read failed. **NaN is never sent** |
+| `soil_raw` | The averaged 12-bit ADC count (0–4095); **higher means drier**. `null` on failure |
+| `rssi_dbm` | Optional integer |
+| `fw` | String |
+
+Further telemetry rules:
+- The **firmware does not send `soil_pct`** and has no calibration logic.
+- The gateway **ignores unknown fields**.
+- The ESP32 **drops readings while the broker is unreachable**.
+- The interval is **60 s**.
+
+**Status.** Topic `olvar/v1/<device_id>/status`, retained, QoS 1. The payload is the plain string `online`, published
+on connect, or `offline`, sent as the last will.
+
+**MQTT auth.** Traffic is unencrypted on the LAN. Each device logs in with its own username and password, where the
+username and client id equal the `device_id`. The ACL lets a device write only its own two topics.
+
+**Soil calibration.** It is stored in the database as `devices.soil_dry_raw` and `devices.soil_wet_raw`, together
+with `soil_calibrated_at`.
+- The dashboard's Soil calibration screen writes these values from live `soil_raw`.
+- RLS lets the owner update only these three columns.
+- A check enforces `soil_dry_raw > soil_wet_raw + 100`.
+- `soil_pct` is computed server-side, in the database, at read time. It is null until the device is calibrated.
+- **After recalibration, every past reading and summary is re-expressed with the new calibration.** Rows are never
+  rewritten; see D7 and R6.
+
+**Status pill.** The pill comes from the view `public.plant_status_v`, one row per plant:
+- `overall`: one of `great | okay | needs_attention | in_trouble | offline | no_data`. The dashboard maps it to text
+  such as "Feeling great".
+- Per-metric status for temperature, humidity, light and soil: one of
+  `critical_low | low | ok | high | critical_high | unknown`.
+- Supporting columns: `latest_reading_at`, `issues`, and `soil_calibrated`.
+
+**Chat.** The Edge Function `chat`:
+- Request: `POST /functions/v1/chat` with the user's JWT and body `{"plant_id": uuid, "message": string ≤ 1000}`.
+- Response: `{"reply": {chat_messages row}}`.
+- Messages are stored in `chat_messages`. The dashboard lists them from that table and subscribes to its INSERTs.
+
+**Dashboard reads** go through RLS and require a signed-in session; nothing is granted to `anon`.
+- `readings_v` for windows ≤ 48 h, `readings_hourly_v` for ≤ 90 d, and `readings_daily_v` beyond that.
+- `plant_status_v`, `plants` (the dashboard may update `nickname` and `timezone`), `devices` (calibration columns are
+  writable), and `chat_messages`.
+- Realtime publication: `readings` (INSERT, used as a signal), `devices` (UPDATE), `chat_messages` (INSERT).
+
+**Types.** `supabase/types/database.types.ts` is generated and committed in olvar-gateway. The dashboard syncs a
+pinned copy.
+
+**Other final items:**
+- Only the new publishable and secret keys are used.
+- Raw readings are kept 90 days, with hourly and daily summaries.
+- No off-site backups.
+- Firmware is updated over USB only.
+- The hardware is a Pi 3B, connected over Wi-Fi/MQTT, with 60 s updates. Where Figma says "Pi 4", "USB serial" or
+  "10 s", the app follows the real hardware.
 
 ---
 
@@ -320,61 +362,42 @@ Example v1 telemetry (also stored in `contracts/examples/valid-full.json`):
 
 ### 5.1 Data flow
 ```
-ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, auth+ACL)
-                         │  olvar/v1/<id>/telemetry, /status (retained, LWT)
+ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
+                       olvar/v1/<id>/telemetry · /status (retained, LWT)
                          ▼
                  olvar-gateway (Pi, systemd)
-   validate (pydantic) → stamp time (if NTP-synced) → SQLite outbox (WAL, FULL)
-                         │ uploader thread: batch ≤500, upsert ignore-duplicates, backoff
-                         ▼
-            Supabase PostgREST (secret key) ──▶ Postgres
-                                               ├─ readings ─┐ pg_cron :05 → readings_hourly/daily
-                                               ├─ devices   │ pg_cron 03:30 UTC → delete raw > 90 d
-                                               └─ avatar_states ◀─ Edge Fn avatar-tick ◀─ pg_cron */15
-                                                      │                └─▶ DeepSeek deepseek-flash
-                                Realtime (postgres_changes, RLS) ──▶ Expo dashboard (publishable key + login)
+   validate → stamp time (if NTP-synced) → SQLite outbox → uploader (batch ≤500, upsert ignore-dup, backoff)
+                         ▼  PostgREST, secret key "gateway"
+   Postgres: readings · devices(calibration) · plants · plant_profiles · readings_hourly/daily · chat_messages · gateways
+     views:  readings_v / readings_hourly_v / readings_daily_v (soil_pct)   plant_status_v (pill)
+     pg_cron: :05 hourly → refresh_rollups · 03:30 UTC → delete raw > 90 d
+                         ▲                                   ▲
+   Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ DeepSeek deepseek-flash
+          └── Realtime: readings INSERT (signal), devices UPDATE, chat_messages INSERT
 ```
 
 ### 5.2 Repository layout
 ```
 olvar-gateway/
-├── README.md
-├── docs/PLAN.md · docs/DEPLOY.md · docs/RUNBOOK.md
+├── README.md · docs/{PLAN,DEPLOY,RUNBOOK}.md
 ├── pyproject.toml · uv.lock · requirements.txt (uv export, hashed)
-├── contracts/
-│   ├── telemetry.v1.schema.json          # JSON Schema for the payload (shared with firmware)
-│   └── examples/{valid-*.json,invalid-*.json}
-├── src/olvar_gateway/
-│   ├── __main__.py      # python -m olvar_gateway
-│   ├── config.py        # env → Settings (frozen dataclass)
-│   ├── models.py        # Telemetry (pydantic), ReadingRow, parse_message()
-│   ├── clock.py         # NTP-sync detection, monotonic backfill
-│   ├── buffer.py        # Outbox (SQLite)
-│   ├── uploader.py      # SupabaseWriter (httpx) + Uploader loop
-│   ├── mqtt_client.py   # paho wrapper, subscriptions, status handling
-│   ├── service.py       # wiring, threads, heartbeat, signals
-│   └── log.py           # JSON-lines logging to stdout
-├── tests/               # pytest unit + tests/e2e (docker mosquitto + supabase local)
-├── tools/
-│   ├── fake_esp32.py    # simulated device(s)
-│   └── provision_device.py  # create MQTT user + devices row + owner/plant link
-├── dev/compose.yml      # mosquitto for local dev, using deploy/mosquitto/*
-├── deploy/
-│   ├── mosquitto/olvar.conf · acl
-│   ├── systemd/olvar-gateway.service
-│   ├── journald/olvar.conf
-│   ├── gateway.env.example
-│   └── install.sh · update.sh
+├── contracts/telemetry.v1.schema.json · contracts/examples/{valid-*,invalid-*}.json
+├── src/olvar_gateway/{__main__,config,models,clock,buffer,uploader,mqtt_client,service,log}.py
+├── tests/ (unit) · tests/e2e/
+├── tools/fake_esp32.py · tools/setup_plant.py
+├── dev/compose.yml                     # mosquitto for local dev, using deploy/mosquitto/*
+├── deploy/mosquitto/{olvar.conf,acl} · deploy/systemd/olvar-gateway.service · deploy/journald/olvar.conf
+│   deploy/gateway.env.example · deploy/install.sh · deploy/update.sh
 ├── supabase/
-│   ├── config.toml
+│   ├── config.toml · seed.sql
 │   ├── migrations/
-│   │   ├── 20261116000100_core.sql       # tables, grants, RLS, publication
-│   │   ├── 20261116000200_rollups.sql    # rollup tables, refresh fn, cron jobs, retention
-│   │   └── 20261116000300_avatar.sql     # avatar_states, cron → avatar-tick
-│   ├── seed.sql                          # spathiphyllum profile, local owner, device, sample data
-│   ├── tests/*.sql                       # pgTAP
-│   ├── functions/avatar-tick/{index.ts,rules.ts,prompt.ts,deepseek.ts,schema.ts,*_test.ts}
-│   └── types/database.types.ts           # generated
+│   │   ├── 20261116000100_core.sql      # profiles, plants, devices, readings, gateways, soil_pct(), readings_v, grants, RLS
+│   │   ├── 20261116000200_rollups.sql   # hourly/daily tables + views, refresh_rollups, cron, retention
+│   │   ├── 20261116000300_status.sql    # thresholds merge fn + plant_status_v
+│   │   └── 20261116000400_chat.sql      # chat_messages, grants, RLS, publication
+│   ├── tests/{core,rollups,status,chat}_test.sql   # pgTAP
+│   ├── functions/chat/{index.ts,context.ts,prompt.ts,deepseek.ts,*_test.ts}
+│   └── types/database.types.ts
 └── .github/workflows/ci.yml
 ```
 
@@ -383,14 +406,14 @@ olvar-gateway/
 # models.py
 class InvalidMessage(Exception): reason: str
 @dataclass(frozen=True)
-class ReadingRow:            # == readings columns minus id/received_at
+class ReadingRow:                       # == readings columns minus id/received_at
     device_id: str; boot_id: str; seq: int; uptime_ms: int
-    recorded_at: datetime | None          # None until clock is trustworthy
+    recorded_at: datetime | None        # None until clock is trustworthy
     temperature_c: float | None; humidity_pct: float | None; lux: float | None
-    soil_raw: int | None; soil_pct: float | None
+    soil_raw: int | None; rssi_dbm: int | None
     clock_source: Literal["ntp", "backfilled", "unsynced"]
 def parse_message(topic: str, payload: bytes) -> Telemetry          # raises InvalidMessage
-def to_row(t: Telemetry, now: Stamp) -> ReadingRow
+def to_row(t: Telemetry, stamp: Stamp) -> ReadingRow
 
 # clock.py
 @dataclass(frozen=True)
@@ -400,341 +423,366 @@ class Clock: def now() -> Stamp; def backfill(mono_ns: int, pi_boot_id: str) -> 
 # buffer.py
 class Outbox:
     def __init__(self, path: Path, max_rows: int = 100_000)
-    def put(self, row: ReadingRow, stamp: Stamp) -> bool      # False if duplicate key already queued
-    def ready(self, limit: int) -> list[tuple[int, ReadingRow]]  # only rows with recorded_at set
+    def put(self, row: ReadingRow, stamp: Stamp) -> bool          # False if (device_id, boot_id, seq) already queued
+    def ready(self, limit: int) -> list[tuple[int, ReadingRow]]   # only rows with recorded_at set
     def ack(self, ids: list[int]) -> None
     def dead_letter(self, ids: list[int], reason: str) -> None
-    def resolve_unsynced(self, clock: Clock) -> int           # fill recorded_at after NTP sync
+    def resolve_unsynced(self, clock: Clock) -> int
     def depth(self) -> int
 
 # uploader.py
 class SupabaseWriter:
     def __init__(self, url: str, secret_key: str, client: httpx.Client)
-    def upsert_readings(self, rows) -> UploadResult   # ok | retryable | permanent(per-row reasons)
+    def upsert_readings(self, rows) -> UploadResult    # ok | retryable | permanent(per-row reasons)
     def upsert_device(self, device_id, *, status=None, fw=None, last_seen_at=None) -> UploadResult
     def heartbeat(self, gateway_id, version, buffer_depth) -> UploadResult
 ```
 
-### 5.4 Key behaviours
-- **Validation:** the message must be a JSON object of at most 1 KiB, `device_id` must match the topic segment and the
-  id regex, `boot_id` must be 8 hex characters, and `seq`/`uptime_ms` must be ≥ 0. Physical ranges: temperature
-  −40…125 °C (SHT31), humidity 0…100, lux 0…120,000, soil_raw 0…4095 (12-bit ADC), soil_pct 0…100. Out-of-range
-  fields become null and increment a counter. Invalid messages are logged with a rate limit (one log per device per
-  minute plus a counter).
-- **Time:** `synced` means `/run/systemd/timesync/synchronized` exists [6] and `wall` is later than the build date.
-  While unsynced, a row is stored with `mono_ns` and the Pi's `/proc/sys/kernel/random/boot_id`, and
-  `recorded_at = NULL`. Once synced, `resolve_unsynced` sets `recorded_at = wall_now − (mono_now − mono_ns)` for rows
-  from the same Pi boot (`clock_source='backfilled'`). Rows from an earlier Pi boot that never synced are uploaded with
-  the best-effort wall time and `clock_source='unsynced'`, and charts may hide them.
-- **Outbox:** SQLite in WAL mode with `synchronous=FULL` and `busy_timeout=5000`, one connection per thread, at
-  `/var/lib/olvar-gateway/outbox.db`. There is a unique index on `(device_id, boot_id, seq)`, so a QoS 1 duplicate is
-  ignored locally. At `max_rows` the oldest rows are dropped with an ERROR log (100k rows is about 70 days of one
-  device).
-- **Uploader:** an event triggers it after each `put`, plus a 5 s tick. It sends `ready(500)` →
-  `POST /rest/v1/readings?on_conflict=device_id,boot_id,seq` with
-  `Prefer: resolution=ignore-duplicates,return=minimal` [19]. 2xx means ack. Network errors, 5xx and 429 mean back off
-  exponentially with jitter (1 s → 5 min cap). For a 4xx (e.g. FK or check violation) it retries each row on its own
-  to isolate the bad one; the bad row is dead-lettered and the rest are acked. Before a device's first reading it
-  upserts the `devices` row (id, fw, last_seen_at) with merge-duplicates. Only payload columns are updated, so
-  `owner_id` and `plant_id` are left alone.
-- **MQTT:** client id `olvar-gateway`, MQTT 5, `clean_start=False`, session expiry 1 day, subscribed to
-  `olvar/v1/+/telemetry` (QoS 1) and `olvar/v1/+/status` (QoS 1). Mosquitto then queues QoS 1 messages while the
-  gateway restarts (default queue of 1,000 messages ≈ 16 h for one device). Status messages update
-  `devices.status`, `status_changed_at` and `last_seen_at`.
-- **Heartbeat:** every 5 min the gateway upserts `gateways(id, version, buffer_depth, last_seen_at)`. This shows "Pi
-  offline" on the dashboard and keeps the Free project active (it pauses after 7 days of low activity [29]).
-- **Logging:** JSON lines to stdout, which journald stores; a journald drop-in caps it at `SystemMaxUse=50M` [24]. There
-  is no file logging.
-- **Shutdown:** on SIGTERM it stops MQTT, flushes the uploader for up to 10 s and closes SQLite.
+### 5.4 Gateway behaviour
+- **Validation:**
+  - The payload must be a JSON object of at most 1 KiB, and unknown keys are ignored.
+  - `device_id` must match both the topic segment and the id regex.
+  - `boot_id` must be 8 hex characters, and `seq` and `uptime_ms` must be ≥ 0.
+  - Physical ranges: temperature −40…125 °C, humidity 0…100, lux 0…120,000, soil_raw 0…4095, rssi_dbm −120…0.
+  - An out-of-range field becomes `null` and increments a counter.
+  - Invalid messages are logged at most once per device per minute.
+- **Time:**
+  - "Synced" means the file `/run/systemd/timesync/synchronized` exists [6].
+  - While unsynced, rows are stored with `mono_ns` and the Pi's boot id, and `recorded_at` stays NULL.
+  - After the clock syncs, rows from the same Pi boot get `recorded_at = wall − (mono_now − mono_ns)` and
+    `clock_source='backfilled'`.
+  - Rows from an earlier Pi boot that never synced are uploaded with their best-effort time and
+    `clock_source='unsynced'`.
+- **Outbox:**
+  - SQLite with `journal_mode=WAL`, `synchronous=FULL` and `busy_timeout=5000`, at
+    `/var/lib/olvar-gateway/outbox.db`.
+  - A unique index on `(device_id, boot_id, seq)`.
+  - It holds at most 100k rows, about 70 days for one device. Above that, the oldest rows are dropped with an ERROR log.
+- **Uploader:**
+  - It runs on each new row and on a 5 s tick.
+  - Request: `POST /rest/v1/readings?on_conflict=device_id,boot_id,seq` with
+    `Prefer: resolution=ignore-duplicates,return=minimal` and the `apikey` header [19][21].
+  - Network errors, 5xx and 429 responses trigger exponential backoff with jitter, from 1 s up to 5 min.
+  - On a 4xx it retries row by row; the offending row goes to the dead-letter table and the rest are acknowledged.
+  - Device rows are upserted with only `{id, fw, last_seen_at}`, so the calibration and owner columns are never touched.
+- **MQTT:**
+  - Client id `olvar-gateway`, MQTT 5, `clean_start=False`, session expiry of one day.
+  - Subscriptions at QoS 1: `olvar/v1/+/telemetry` and `olvar/v1/+/status`.
+  - Status messages update `devices.status`, `status_changed_at` and `last_seen_at`.
+- **Heartbeat:**
+  - Every 5 min it upserts `gateways(id, version, buffer_depth, last_seen_at)`.
+  - This also keeps the Free project from pausing for inactivity [29].
+- **Logging:** JSON lines on stdout, captured by journald and capped at 50 MB [24].
+- **Shutdown:** on SIGTERM it stops MQTT, flushes for up to 10 s and closes SQLite.
 
 ### 5.5 Mosquitto config (deploy/mosquitto)
 ```conf
-# /etc/mosquitto/conf.d/olvar.conf   (persistence is already enabled in the Debian main file — don't repeat it)
+# /etc/mosquitto/conf.d/olvar.conf  (persistence already enabled by the Debian main file)
 listener 1883 0.0.0.0
 allow_anonymous false
 password_file /etc/mosquitto/passwd
 acl_file /etc/mosquitto/acl
 ```
 ```conf
-# /etc/mosquitto/acl
-# every device: username == device_id, may only write its own topics (incl. its LWT)
+# /etc/mosquitto/acl  — username == device_id
 pattern write olvar/v1/%u/telemetry
 pattern write olvar/v1/%u/status
 user olvar-gateway
 topic read olvar/v1/+/telemetry
 topic read olvar/v1/+/status
 ```
-The files belong to `mosquitto:mosquitto` with mode 0600 [15]. A firewall (nftables) allows 1883 only from the LAN
-subnet. The Pi is reached by a DHCP reservation and, as a fallback, mDNS `olvar-gw.local`.
+The files are owned by `mosquitto:mosquitto` with mode 0600 [15]. nftables allows port 1883 only from the LAN subnet.
+The Pi is reached through a DHCP reservation, with mDNS `olvar-gw.local` as a fallback.
 
-### 5.6 Supabase schema (complete proposal: `20261116000100_core.sql` and the two following migrations)
+### 5.6 Supabase schema (v1 only)
 ```sql
--- ===== core =====
+-- ===== 20261116000100_core.sql =====
 create table public.plant_profiles (
-  id              text primary key,                 -- 'spathiphyllum'
-  common_name     text not null,
-  scientific_name text not null,
-  thresholds      jsonb not null,                   -- {temperature_c:{critical_low,low,ok_low,ok_high,high,critical_high}, humidity_pct:{…}, lux:{…}, soil_pct:{…}}
-  sources         text[] not null default '{}',
-  updated_at      timestamptz not null default now()
+  id text primary key,                          -- 'spathiphyllum'
+  common_name text not null, scientific_name text not null,
+  thresholds jsonb not null,                    -- {temperature_c:{critical_low,low,ok_low,ok_high,high,critical_high}, humidity_pct:{…}, lux:{…}, soil_pct:{…}}
+  care_notes text not null,                     -- short evidence-based care summary fed to chat (§2.8)
+  sources text[] not null default '{}'
 );
 
 create table public.plants (
-  id                  uuid primary key default gen_random_uuid(),
-  owner_id            uuid not null references auth.users(id) on delete cascade,
-  profile_id          text not null references public.plant_profiles(id),
-  nickname            text not null default 'Lily' check (char_length(nickname) between 1 and 40),
-  timezone            text not null default 'UTC',  -- IANA, used for day/night + daily buckets
-  locale              text not null default 'en',   -- avatar message language
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid not null references auth.users(id) on delete cascade,
+  profile_id text not null references public.plant_profiles(id),
+  nickname text not null default 'Lily' check (char_length(nickname) between 1 and 40),
+  timezone text not null default 'UTC',         -- IANA; set by setup script, editable in Settings
   threshold_overrides jsonb not null default '{}',
-  created_at          timestamptz not null default now()
+  created_at timestamptz not null default now()
 );
 create index plants_owner_idx on public.plants (owner_id);
 
 create table public.devices (
-  id                text primary key check (id ~ '^[a-z0-9][a-z0-9-]{2,31}$' and id <> 'olvar-gateway'),
-  owner_id          uuid references auth.users(id) on delete set null,
-  plant_id          uuid references public.plants(id) on delete set null,
-  fw                text,
-  status            text not null default 'unknown' check (status in ('online','offline','unknown')),
+  id text primary key check (id ~ '^[a-z0-9][a-z0-9-]{2,31}$' and id <> 'olvar-gateway'),
+  owner_id uuid references auth.users(id) on delete set null,
+  plant_id uuid unique references public.plants(id) on delete set null,   -- v1: one device per plant
+  fw text,
+  status text not null default 'unknown' check (status in ('online','offline','unknown')),
   status_changed_at timestamptz,
-  last_seen_at      timestamptz,
-  created_at        timestamptz not null default now()
+  last_seen_at timestamptz,
+  soil_dry_raw integer check (soil_dry_raw between 0 and 4095),
+  soil_wet_raw integer check (soil_wet_raw between 0 and 4095),
+  soil_calibrated_at timestamptz,
+  created_at timestamptz not null default now(),
+  constraint soil_cal_pair check ((soil_dry_raw is null) = (soil_wet_raw is null)),
+  constraint soil_cal_order check (soil_dry_raw is null or soil_dry_raw > soil_wet_raw + 100)
 );
 create index devices_owner_idx on public.devices (owner_id);
 
 create table public.readings (
-  id            bigint generated always as identity primary key,
-  device_id     text not null references public.devices(id) on delete cascade,
-  recorded_at   timestamptz not null,
-  received_at   timestamptz not null default now(),
-  boot_id       text not null check (boot_id ~ '^[0-9a-f]{8}$'),
-  seq           integer not null check (seq >= 0),
-  uptime_ms     bigint not null check (uptime_ms >= 0),
+  id bigint generated always as identity primary key,
+  device_id text not null references public.devices(id) on delete cascade,
+  recorded_at timestamptz not null,
+  received_at timestamptz not null default now(),
+  boot_id text not null check (boot_id ~ '^[0-9a-f]{8}$'),
+  seq integer not null check (seq >= 0),
+  uptime_ms bigint not null check (uptime_ms >= 0),
   temperature_c real check (temperature_c between -40 and 125),
-  humidity_pct  real check (humidity_pct between 0 and 100),
-  lux           real check (lux between 0 and 120000),
-  soil_raw      integer check (soil_raw between 0 and 4095),
-  soil_pct      real check (soil_pct between 0 and 100),
-  clock_source  text not null default 'ntp' check (clock_source in ('ntp','backfilled','unsynced')),
+  humidity_pct real check (humidity_pct between 0 and 100),
+  lux real check (lux between 0 and 120000),
+  soil_raw smallint check (soil_raw between 0 and 4095),
+  rssi_dbm smallint check (rssi_dbm between -120 and 0),
+  clock_source text not null default 'ntp' check (clock_source in ('ntp','backfilled','unsynced')),
   constraint readings_dedup unique (device_id, boot_id, seq)
 );
 create index readings_device_time_idx on public.readings (device_id, recorded_at desc);
-create index readings_received_idx    on public.readings (received_at);
+create index readings_received_idx on public.readings (received_at);
 
 create table public.gateways (
-  id           text primary key,
-  owner_id     uuid references auth.users(id) on delete set null,
-  version      text,
-  buffer_depth integer,
-  last_seen_at timestamptz not null default now()
+  id text primary key, owner_id uuid references auth.users(id) on delete set null,
+  version text, buffer_depth integer, last_seen_at timestamptz not null default now()
 );
 
--- grants (explicit: required since the 2026 default-privileges change [11])
-grant select                         on public.plant_profiles, public.devices, public.readings, public.gateways to authenticated;
-grant select                         on public.plants to authenticated;
-grant update (nickname, timezone, locale, threshold_overrides) on public.plants to authenticated;
+-- one formula, used by every view; higher raw = drier
+create function public.soil_pct(raw numeric, dry_raw integer, wet_raw integer) returns real
+  language sql immutable parallel safe set search_path = '' as $$
+  select case when raw is null or dry_raw is null or wet_raw is null then null
+              else greatest(0, least(100, round(((dry_raw - raw) * 100.0 / (dry_raw - wet_raw))::numeric, 1)))::real end $$;
+
+create view public.readings_v with (security_invoker = true) as
+  select r.*, public.soil_pct(r.soil_raw, d.soil_dry_raw, d.soil_wet_raw) as soil_pct
+  from public.readings r join public.devices d on d.id = r.device_id;
+
+-- grants (explicit, required since the 2026 default-privileges change [11])
+grant select on public.plant_profiles, public.plants, public.devices, public.readings, public.readings_v, public.gateways to authenticated;
+grant update (nickname, timezone) on public.plants to authenticated;
+grant update (soil_dry_raw, soil_wet_raw, soil_calibrated_at) on public.devices to authenticated;
 grant select, insert, update, delete on public.plant_profiles, public.plants, public.devices, public.readings, public.gateways to service_role;
+grant select on public.readings_v to service_role;
 grant usage, select on all sequences in schema public to service_role;
+grant execute on function public.soil_pct(numeric, integer, integer) to authenticated, service_role;
 
--- RLS
-alter table public.plant_profiles enable row level security;
-alter table public.plants         enable row level security;
-alter table public.devices        enable row level security;
-alter table public.readings       enable row level security;
-alter table public.gateways       enable row level security;
-
-create policy profiles_read  on public.plant_profiles for select to authenticated using (true);
-create policy plants_read    on public.plants  for select to authenticated using (owner_id = (select auth.uid()));
-create policy plants_update  on public.plants  for update to authenticated
+-- RLS (enabled on every table)
+create policy profiles_read on public.plant_profiles for select to authenticated using (true);
+create policy plants_read   on public.plants  for select to authenticated using (owner_id = (select auth.uid()));
+create policy plants_update on public.plants  for update to authenticated
   using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
-create policy devices_read   on public.devices for select to authenticated using (owner_id = (select auth.uid()));
-create policy gateways_read  on public.gateways for select to authenticated using (owner_id = (select auth.uid()));
-create policy readings_read  on public.readings for select to authenticated
+create policy devices_read  on public.devices for select to authenticated using (owner_id = (select auth.uid()));
+create policy devices_calibrate on public.devices for update to authenticated
+  using (owner_id = (select auth.uid())) with check (owner_id = (select auth.uid()));
+create policy gateways_read on public.gateways for select to authenticated using (owner_id = (select auth.uid()));
+create policy readings_read on public.readings for select to authenticated
   using (device_id in (select d.id from public.devices d where d.owner_id = (select auth.uid())));
-
 alter publication supabase_realtime add table public.readings, public.devices;
 
--- ===== rollups (20261116000200_rollups.sql) =====
+-- ===== 20261116000200_rollups.sql =====
 create extension if not exists pg_cron;
-
 create table public.readings_hourly (
   device_id text not null references public.devices(id) on delete cascade,
-  bucket    timestamptz not null,                   -- UTC hour start
-  n         integer not null,
+  bucket timestamptz not null,                                  -- UTC hour
+  n integer not null,
   temperature_c_avg real, temperature_c_min real, temperature_c_max real,
-  humidity_pct_avg  real, humidity_pct_min  real, humidity_pct_max  real,
+  humidity_pct_avg real,  humidity_pct_min real,  humidity_pct_max real,
   lux_avg real, lux_min real, lux_max real,
-  soil_pct_avg real, soil_pct_min real, soil_pct_max real,
+  soil_raw_avg real, soil_raw_min smallint, soil_raw_max smallint,
   primary key (device_id, bucket)
 );
--- readings_daily: identical columns to readings_hourly except `bucket date`
--- (= local calendar date in the plant's timezone, UTC if the device has no plant); primary key (device_id, bucket).
-
--- refresh_rollups(since): recompute every (device, hour) touched by rows RECEIVED since `since`,
--- so late rows flushed from the Pi buffer are folded in. Daily = weighted from hourly (sum(avg*n)/sum(n)).
+-- readings_daily: same columns, `bucket date` = local date in plants.timezone (UTC if no plant).
+-- readings_hourly_v / readings_daily_v (security_invoker): add soil_pct_avg = soil_pct(soil_raw_avg),
+--   soil_pct_min = soil_pct(soil_raw_max), soil_pct_max = soil_pct(soil_raw_min)   (inverted: higher raw = drier)
 create function public.refresh_rollups(since timestamptz) returns void
   language plpgsql security definer set search_path = '' as $$ … $$;
+  -- recompute every (device, hour) touched by rows RECEIVED since `since` (late buffered rows fold in);
+  -- daily = weighted from hourly (sum(avg*n)/sum(n)); idempotent upserts
 revoke execute on function public.refresh_rollups(timestamptz) from public, anon, authenticated;
-
 select cron.schedule('olvar-rollups',   '5 * * * *',  $$select public.refresh_rollups(now() - interval '2 hours')$$);
 select cron.schedule('olvar-retention', '30 3 * * *', $$delete from public.readings where recorded_at < now() - interval '90 days'$$);
--- grants + RLS on rollup tables mirror readings (select to authenticated via devices.owner_id; all to service_role)
+-- grants/RLS mirror readings (select to authenticated via devices.owner_id; all to service_role)
 
--- ===== avatar (20261116000300_avatar.sql) =====
-create extension if not exists pg_net;
+-- ===== 20261116000300_status.sql =====
+-- effective_thresholds(plant_id) = profile.thresholds deep-merged per metric with plants.threshold_overrides
+-- plant_status_v (security_invoker), one row per plant the caller can see:
+--   plant_id, device_id, latest_reading_at, device_status, soil_calibrated boolean,
+--   temperature_status, humidity_status, light_status, soil_status   -- critical_low|low|ok|high|critical_high|unknown
+--   issues text[]                                                    -- metric keys, worst first
+--   overall text  -- great | okay | needs_attention | in_trouble | offline | no_data
+-- Rules (thresholds in §2.8):
+--   no reading ever → no_data;  latest reading > 5 min old or device_status = 'offline' → offline
+--   temperature/humidity: median of last 30 min; humidity "high" only if > high for 12 h
+--   light: daytime (08–18 local) mean over 24 h for low side; max 10-min median for high side
+--   soil: latest 10-min median of soil_pct via readings_v; unknown if uncalibrated; "high" only if > high for 48 h
+--   any critical_* → in_trouble; any low/high → needs_attention; all ok and every value in the middle half of its
+--   ok band → great; else okay. unknown metrics never raise severity.
+grant select on public.plant_status_v to authenticated, service_role;
 
-create table public.avatar_states (
-  id                  bigint generated always as identity primary key,
-  plant_id            uuid not null references public.plants(id) on delete cascade,
-  created_at          timestamptz not null default now(),
-  based_on_reading_at timestamptz,
-  mood       text not null check (mood in ('thriving','ok','needs_attention','in_trouble','offline')),
-  expression text not null check (expression in ('happy','content','thirsty','soggy','cold','hot','gloomy','sunburnt','dry_air','sleepy','offline')),
-  message    text not null check (char_length(message) between 1 and 280),
-  advice     jsonb not null default '[]',   -- [{metric:'soil_pct'|'temperature_c'|'humidity_pct'|'lux', priority:'now'|'soon'|'fyi', text:string}] ≤3
-  metric_status jsonb not null,              -- {"temperature_c":"ok","soil_pct":"low",…}  values: critical_low|low|ok|high|critical_high|unknown
-  source     text not null check (source in ('llm','rules')),
-  model      text,
-  prompt_version  text not null,
-  state_signature text not null,
-  tokens_in  integer, tokens_out integer
+-- ===== 20261116000400_chat.sql =====
+create table public.chat_messages (
+  id bigint generated always as identity primary key,
+  plant_id uuid not null references public.plants(id) on delete cascade,
+  role text not null check (role in ('user','plant')),
+  content text not null check (char_length(content) between 1 and 2000),
+  created_at timestamptz not null default now(),
+  model text, tokens_in integer, tokens_out integer,          -- set on 'plant' rows
+  error text                                                  -- set when the plant reply is a fallback
 );
-create index avatar_states_plant_time_idx on public.avatar_states (plant_id, created_at desc);
-grant select on public.avatar_states to authenticated;
-grant select, insert on public.avatar_states to service_role;
-alter table public.avatar_states enable row level security;
-create policy avatar_read on public.avatar_states for select to authenticated
+create index chat_messages_plant_time_idx on public.chat_messages (plant_id, created_at desc);
+grant select on public.chat_messages to authenticated;
+grant select, insert on public.chat_messages to service_role;
+alter table public.chat_messages enable row level security;
+create policy chat_read on public.chat_messages for select to authenticated
   using (plant_id in (select p.id from public.plants p where p.owner_id = (select auth.uid())));
-alter publication supabase_realtime add table public.avatar_states;
-
--- cron → Edge Function; URL + key come from Vault (set by hand, never in migrations) [21]
-select cron.schedule('olvar-avatar-tick', '*/15 * * * *', $$
-  select net.http_post(
-    url := (select decrypted_secret from vault.decrypted_secrets where name = 'project_url') || '/functions/v1/avatar-tick',
-    headers := jsonb_build_object('Content-Type','application/json',
-               'apikey', (select decrypted_secret from vault.decrypted_secrets where name = 'avatar_cron_key')),
-    body := '{}'::jsonb, timeout_milliseconds := 30000) $$);
+alter publication supabase_realtime add table public.chat_messages;
+-- inserts happen only inside the `chat` function (service role), so clients cannot forge 'plant' messages
 ```
 
-### 5.7 Avatar Edge Function `avatar-tick` (Deno/TypeScript)
-1. Authenticate with `withSupabase({ auth: 'secret' })` and `verify_jwt = false` [33].
-2. For each plant that has a device, load the last reading and 24 h of readings plus `readings_hourly`, then merge
-   `plant_profiles.thresholds` with `threshold_overrides`.
-3. Run **`rules.ts`** (pure functions, unit-tested):
-   - Compute a status for each metric with the windows from §2.8. Light uses daytime only, in `plants.timezone`.
-   - Detect a **watering event**: `soil_pct` rises by 15 or more within 30 min.
-   - Staleness: no reading in the last 15 min means `offline`.
-   - Mood priority is offline > any critical (`in_trouble`) > any low/high (`needs_attention`) > all ok
-     (`thriving` if every metric is mid-range, otherwise `ok`).
-   - Expression comes from the worst metric (soil low → `thirsty`, soil high → `soggy`, temperature low → `cold`,
-     light high → `sunburnt`, light low → `gloomy`, humidity low → `dry_air`). It is `sleepy` at night when all is ok.
-   - `state_signature` = hash(mood, expression, sorted metric_status).
-4. If the signature is unchanged and the last `source='llm'` row is less than 3 h old, skip. If it is unchanged and
-   younger than 3 h for a rules row, skip as well.
-5. Otherwise call DeepSeek: `POST https://api.deepseek.com/chat/completions` with `model:"deepseek-flash"`,
-   `thinking:{type:"disabled"}`, `response_format:{type:"json_object"}`, `max_tokens:400` and `temperature:0.8`
-   (temperature is honoured only in non-thinking mode [41]). The timeout is 20 s. A blank or invalid JSON response is
-   retried once [42], and after that it falls back to templates in `rules.ts` (`source='rules'`).
-6. Validate the output with a schema (`message` ≤ 280 chars, ≤ 3 advice items whose `metric` must be in the
-   problematic set). Insert an `avatar_states` row.
+### 5.7 Edge Function `chat` (Deno/TypeScript)
+1. **Auth:** require the caller's JWT (`verify_jwt` stays on) [33]. Read the plant through a user-scoped client;
+   RLS then proves ownership, and a non-owner gets 404.
+2. **Input:** `message` is trimmed and must be 1–1000 characters.
+   - Rate limit: at most 10 user messages per 5 min and 200 per day for each plant, counted from `chat_messages`.
+     Over the limit, return 429 with a `retry_after` value.
+3. **Store** the user's row with the admin client (`role='user'`).
+4. **Build the context:**
+   - plant nickname and profile `care_notes`;
+   - the effective thresholds;
+   - the `plant_status_v` row;
+   - the latest `readings_v` row;
+   - 24 h of hourly data from `readings_hourly_v`, condensed to min/avg/max per 6 h;
+   - 7 d of daily data from `readings_daily_v`;
+   - the current local time in `plants.timezone`;
+   - the last 20 `chat_messages` as alternating user/assistant turns.
+5. **Call DeepSeek:**
+   - `POST https://api.deepseek.com/chat/completions` with `model:"deepseek-flash"`,
+     `thinking:{type:"disabled"}`, `max_tokens:350` and `temperature:0.7` [41][43].
+   - Timeout of 25 s; one retry on 429, 5xx or an empty reply.
+   - `DEEPSEEK_MODEL` and `DEEPSEEK_BASE_URL` can be overridden through env (the base URL is used for the test
+     stub).
+6. **Store the reply** with `role='plant'`, the model name and the token usage, then return it.
+   - If DeepSeek fails, store and return a short deterministic fallback built from `plant_status_v`, with `error` set,
+     so the conversation never hangs.
 
-**Prompt (version `v1`)**. The system prompt is static so the prefix can be cached:
-> You are {nickname}, a peace lily (Spathiphyllum) living in a pot. You speak in first person, warm and a little
-> playful, in {locale}. You are given JSON with your sensor data, a per-metric status computed by rules, and the issues
-> to address. Never contradict the given status, never invent measurements, never recommend chemicals or fertiliser
-> doses. Output **json** only, exactly this shape: `{"message": "...", "advice": [{"metric": "...", "priority":
-> "now|soon|fyi", "text": "..."}]}`. message: at most 2 sentences, ≤ 200 characters. advice: one item per given issue
-> (max 3), each ≤ 100 characters, concrete (e.g., "Water until it drains, then empty the saucer."). If there are no
-> issues, advice is []. Example: {…one full example…}
+**System prompt (static prefix, so it can be cached):**
+> You are {nickname}, a peace lily (Spathiphyllum) in a pot, chatting with the person who looks after you.
+> Speak in first person as the plant, warm and a little playful, in 1–4 short sentences.
+> **Always reply in the same language as the person's latest message.**
+> Your feelings must match the STATUS and MEASUREMENTS given below. Never invent readings; if a value is null or
+> unknown, say you can't sense it right now.
+> For care questions, give concrete advice based on the CARE NOTES and THRESHOLDS. Never recommend chemicals or
+> fertilizer doses.
+> If soil is "unknown" because the probe is not calibrated, suggest the Soil calibration screen.
+> Stay in character, and politely steer off-topic requests back to plant care.
 
-The user message is JSON: `{now_local, time_of_day, mood, expression, metrics:{temperature_c:{value, status,
-min_24h, max_24h}, …}, issues:[…], last_watered_hours_ago, offline:false}`. `nickname` and `locale` are the only
-per-plant values in the system prompt, so the cached prefix is stable for each plant.
+The dynamic context block (status, measurements, summaries, local time) is added as a second system message, after
+the static prefix and before the history.
 
 ---
 
 ## 6. Task breakdown (each task owns disjoint files; parallel workers)
 
-Shared prerequisites: the interfaces in §5.3, the schema in §5.6 and the contract in §4 are fixed by this plan. Each
-task adds its own tests and must pass `uv run pytest`, `supabase test db` and `deno test` as relevant.
+The interfaces in §5.3, the schema in §5.6 and the contract in §4 are fixed by this plan. Every task adds its own
+tests. Depending on what it touches, it must pass `uv run pytest`, `supabase test db` and/or `deno test`.
 
 | ID | Owner files | Depends on | Acceptance criteria | Verify (no hardware) |
 |---|---|---|---|---|
-| **T1 Supabase core schema** | `supabase/config.toml`, `supabase/migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_rls_test.sql` | — | Tables, grants, RLS and publication exactly as in §5.6. The seed creates the spathiphyllum profile with §2.8 thresholds and sources, a local owner user, a plant, device `lily-01` and 48 h of synthetic readings. pgTAP proves: the owner sees their rows; a second user sees 0; anon gets `42501`/0 rows; service_role can insert; the dedup unique key rejects a duplicate | `supabase start && supabase db reset && supabase test db` |
-| **T2 Rollups & retention** | `supabase/migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL (fixed in plan) | `refresh_rollups` is idempotent. Late rows (old `recorded_at`, new `received_at`) update their old bucket. Daily values are weighted by `n` and bucketed in the plant's timezone. Retention deletes only rows older than 90 days. Cron jobs are registered | pgTAP with inserted fixtures; `select * from cron.job` |
-| **T3 Avatar Edge Function** | `supabase/functions/avatar-tick/**`, `supabase/migrations/20261116000300_avatar.sql`, `supabase/tests/avatar_rls_test.sql` | T1 | `rules.ts` is a pure function with table-driven tests for every expression, night, offline and watering detection. A DeepSeek client with a `DEEPSEEK_BASE_URL` override; the stub covers success, blank content, invalid JSON, 429 and timeout, and every failure produces a `rules` row. The skip logic is tested. Thinking is disabled in the request body (asserted) | `deno test supabase/functions/avatar-tick`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl -H "apikey: <local secret>"` against seeded data inserts a row |
-| **T4 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema and the pydantic model agree, checked by tests over every `contracts/examples/*` file. Topic/device_id mismatch is rejected, as are NaN, oversized payloads and a bad boot_id. Out-of-range fields become null. `to_row` maps correctly | `uv run pytest tests/test_models.py` |
-| **T5 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_clock.py`, `tests/test_buffer.py`, `tests/test_uploader.py` | §5.3 interfaces | The outbox survives a process kill (killed in a subprocess, then reopened). Duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. The uploader handles 2xx, 5xx and network errors with backoff, isolates the bad row on a 4xx, and sends the `apikey` and `Prefer` headers and `on_conflict` exactly as in §5.4 | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` test against `supabase start` |
-| **T6 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T4, T5 interfaces | Settings come from env, with a clear error naming any missing variable. Subscriptions use MQTT 5 with a persistent session. Status updates reach devices. The heartbeat runs every 5 min. SIGTERM flushes. Logs are JSON lines | pytest with fake writer/outbox; `python -m olvar_gateway --check-config` |
-| **T7 Fake device + E2E** | `tools/fake_esp32.py`, `dev/compose.yml`, `tests/e2e/**` | T6 runnable | `fake_esp32.py --device lily-01 --interval 2 --speedup 60` simulates a day/night lux curve, soil drying and watering, a reboot (new boot_id, seq reset), QoS 1 duplicates, garbage payloads, a sensor null and an LWT on SIGKILL. E2E scenarios: (a) the happy path inserts N rows, (b) Supabase down for 2 min leaves no loss and no duplicates after recovery, (c) a gateway restart mid-stream loses nothing, (d) a spoofed device_id is rejected, (e) LWT sets devices.status=offline | `docker compose -f dev/compose.yml up -d && supabase start && uv run pytest -m e2e` |
-| **T8 Pi deployment** | `deploy/**`, `tools/provision_device.py`, `docs/DEPLOY.md`, `docs/RUNBOOK.md` | T6 | `install.sh` is idempotent: apt `mosquitto mosquitto-clients python3-venv sqlite3`, user `olvar`, venv in `/opt/olvar-gateway`, `/etc/olvar-gateway/gateway.env` (0640 root:olvar), the unit with `StateDirectory=olvar-gateway` and sandboxing, the journald cap, the nftables rule for 1883. `update.sh` checks out a tag, installs pinned dependencies and restarts. `provision_device.py` adds the MQTT user and the devices row with owner and plant | Run in a Debian Trixie arm64 container or VM (`docker run --platform linux/arm64 debian:trixie`, with systemd checked by `systemd-analyze verify`); `shellcheck` |
-| **T9 CI + types** | `.github/workflows/ci.yml`, `supabase/types/database.types.ts`, `README.md` | T1–T3 | CI jobs: ruff + pytest; `supabase start`, `db reset`, `test db`; `deno test`; type generation that fails the build if the committed types differ | GitHub Actions green on the PR |
+| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Seed:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources), a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
+| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. Daily values are weighted by `n` and use the local date. The views compute inverted soil min/max. Retention deletes only rows > 90 d. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
+| **T3 Status view** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status for every rule in §5.6, including `no_data`, `offline`, uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules | Table-driven pgTAP with fixed `now()` via fixtures |
+| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
+| **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
+| **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. The uploader handles 2xx, 5xx, network errors and 4xx row isolation, and sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
+| **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines | pytest with fakes; `python -m olvar_gateway --check-config` |
+| **T8 Fake device + E2E** | `tools/fake_esp32.py`, `dev/compose.yml`, `tests/e2e/**` | T7 | The fake device simulates a day/night lux curve, soil_raw drying and a watering jump (higher = drier), a reboot (new boot_id, seq reset), QoS 1 duplicates, garbage payloads, null sensors, `rssi_dbm`, and the LWT on SIGKILL. **E2E:** the happy path inserts N rows; Supabase down for 2 min loses nothing and creates no duplicates; a gateway restart loses nothing; a spoofed id is rejected; the LWT makes the device offline and `plant_status_v.overall = offline` | `docker compose -f dev/compose.yml up -d && supabase start && uv run pytest -m e2e` |
+| **T9 Pi deployment & setup** | `deploy/**`, `tools/setup_plant.py`, `docs/DEPLOY.md`, `docs/RUNBOOK.md` | T7 | `install.sh` is idempotent: apt packages, `olvar` user, venv, env file 0640, unit with `StateDirectory` and sandboxing, journald cap, nftables. `update.sh` checks out a tag, installs pinned dependencies and restarts. `setup_plant.py` creates the one plant and device (owner email → owner_id, timezone) and prints the `mosquitto_passwd` command | Debian Trixie arm64 container (`systemd-analyze verify`, `shellcheck`) |
+| **T10 CI + types** | `.github/workflows/ci.yml`, `supabase/types/database.types.ts`, `README.md` | T1–T4 | Jobs: ruff + pytest; supabase start, db reset and test db; deno test; type generation, which fails the build if the committed file differs | GitHub Actions green |
 
-Hardware is needed only for: the real ESP32 publish path (QoS 1 and the LWT through the real Wi-Fi stack), the real
-NTP-less boot on the Pi (unplug WAN, reboot, check `clock_source='backfilled'`), and calibration of `soil_pct`.
+Only these need the real hardware:
+- the ESP32's real QoS 1 and last-will behaviour over Wi-Fi;
+- an offline boot of the Pi (check `clock_source='backfilled'`);
+- probe calibration in the real pot, using the dashboard screen.
 
 ---
 
 ## 7. Things the user must do by hand
 
-1. **Supabase:** create an account and a Free project. Pick the region nearest you, choose a strong database password,
-   and keep "Automatically expose new tables" **off**, which is the default now. Copy the project URL and the
-   publishable key, and **create a named secret key `gateway`**, plus `avatar_cron` for pg_cron [10].
-2. **Supabase CLI** on your dev machine, with **Docker Desktop or OrbStack** (allow about 7 GB of RAM) [36]. Then run
-   `supabase login`, `supabase link --project-ref …`, `supabase db push`, `supabase functions deploy avatar-tick`.
-3. **Vault secrets** in the SQL editor (never put these in git):
-   `select vault.create_secret('https://<ref>.supabase.co','project_url'); select vault.create_secret('<sb_secret avatar_cron>','avatar_cron_key');` [21]
-4. **Auth:** create your owner user in the Dashboard (Authentication → Users), **disable sign-ups**, then run
-   `tools/provision_device.py` so your device and plant rows get your `owner_id`.
-5. **DeepSeek:** create an account at platform.deepseek.com, **top up** (it is prepaid; $2 is plenty), create an API key,
-   and run `supabase secrets set DEEPSEEK_API_KEY=…` [34][40].
-6. **Raspberry Pi:** flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager. Set the hostname `olvar-gw`, your
-   user, SSH and Wi-Fi or Ethernet (Ethernet is preferred). Give the Pi a **DHCP reservation** on your router. Use a
-   good-brand SD card and a reliable PSU [24].
-7. On the Pi: `git clone` the repo, then `sudo deploy/install.sh`, then fill in `/etc/olvar-gateway/gateway.env`
-   (SUPABASE_URL, SUPABASE_SECRET_KEY=gateway key, MQTT password). Run
-   `sudo mosquitto_passwd /etc/mosquitto/passwd lily-01`, which prompts for the ESP32's password, and the same for
-   `olvar-gateway`.
-8. **Firmware side:** put the broker host, port, username and password in the ESP32 config.
-   **Calibrate the soil probe** in your actual pot: record the raw value when the plant "needs water" (top 2–3 cm dry)
-   and again after a full watering has drained [56].
-9. Place the BH1750 at leaf height facing the window, and keep the SHT31 out of direct sun and away from the pot's
-   evaporating surface.
+1. **Supabase project:**
+   - Create a Free project and keep "Automatically expose new tables" **off**.
+   - Copy the project URL and the publishable key.
+   - Create a **named secret key `gateway`** for the Pi [10].
+2. **Supabase CLI** on your dev machine, with Docker Desktop or OrbStack (about 7 GB of RAM) [36]. Run, in order:
+   - `supabase login`
+   - `supabase link --project-ref …`
+   - `supabase db push`
+   - `supabase functions deploy chat`
+3. **Auth:**
+   - Create the owner user (Authentication → Users).
+   - **Disable sign-ups.**
+   - Run `tools/setup_plant.py --owner-email … --device-id olvar-xxxxxx --timezone Area/City`. Take the device id
+     from the ESP32 serial log.
+4. **DeepSeek:**
+   - Create an account at platform.deepseek.com and top up (prepaid).
+   - Create an API key.
+   - Run `supabase secrets set DEEPSEEK_API_KEY=…` [34][40].
+5. **Raspberry Pi:**
+   - Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager: hostname `olvar-gw`, user, SSH, Wi-Fi or
+     Ethernet.
+   - Add a DHCP reservation on your router.
+   - Use a good SD card and a good power supply [24].
+6. **On the Pi:**
+   - `git clone` the repo.
+   - Run `sudo deploy/install.sh`.
+   - Fill in `/etc/olvar-gateway/gateway.env`.
+   - Run `sudo mosquitto_passwd /etc/mosquitto/passwd olvar-xxxxxx` and `… olvar-gateway`.
+7. **ESP32:** enter the Wi-Fi details, broker host, username and password in the firmware config, then flash over USB.
+8. **Soil calibration:** in the dashboard's Soil calibration screen,
+   - capture the dry value when the plant needs water (top 2–3 cm of soil dry);
+   - capture the wet value after a full watering has drained [56].
+9. **Sensor placement:**
+   - BH1750 at leaf height, facing the window.
+   - SHT31 out of direct sun and away from the wet soil surface.
 
 ---
 
 ## 8. Risks and open questions
 
-**Open questions for the user**
-- **Q1** Should the dashboard require a login (the plan's default), or should anyone with the link see a read-only
-  view?
-- **Q2** What language should the avatar speak (`plants.locale`: Korean, English, …), and which timezone should be used
-  for day/night and daily charts?
-- **Q3** Is keeping raw 60 s data for 90 days OK? Hourly data is kept for about 2 years and daily data forever.
-- **Q4** Is sending plant readings to DeepSeek (a China-based provider) acceptable? The data is low-sensitivity and has
-  no personal identifiers apart from the plant nickname.
-- **Q5** The soil thresholds (20/35/85/90%) are heuristics. Will you watch the plant for 1–2 weeks and adjust
-  `threshold_overrides`? The dashboard could offer a "the plant is drooping now" button that records the dry point.
-- **Q6** Is plaintext MQTT on your home LAN acceptable? TLS on 8883 is a documented later step.
-- **Q7** Do you want off-site backups? The Free plan has none [29]. One option is a weekly `supabase db dump` from your
-  laptop.
+**Open questions:** none block v1. The user's 2026-11-16 decisions answered all earlier questions (login, language,
+retention, DeepSeek use, MQTT encryption, backups).
 
-**Risks**
-- **Free-project pause:** a project with no traffic for 7 days is paused [29]. The gateway's heartbeat prevents this
-  while the Pi is online. If the Pi is off for over a week, you have to restore the project from the dashboard.
-- **Pi clock:** with no RTC, a boot without internet gives wrong time [7]. This is mitigated by the backfill logic
-  (§5.4). A €3 DS3231 RTC module would remove the risk.
-- **SD-card corruption on power loss:** use a good card, `synchronous=FULL` for the outbox and capped journald [24][25].
-  A small UPS HAT is optional.
-- **Supabase platform changes:** legacy keys are being removed by the end of 2026 [8], and default grants are gone
-  [11]. The plan uses only the new keys and explicit grants. A table without a grant fails loudly with `42501`.
-- **DeepSeek:** thinking mode is on by default and would burn output tokens if it were not disabled [41]. JSON mode can
-  return blank content [42], which is handled by retry and rules fallback. DeepSeek changes models and prices often
-  (V4.1-Flash-1017 arrived on 17 Oct 2026 [38]), so the model id is configurable (`DEEPSEEK_MODEL`).
-- **Firmware QoS:** if the firmware uses PubSubClient (QoS 0 only [26]), messages published while the gateway restarts
-  are lost. That is about one reading per restart, which is acceptable but worth knowing.
-- **Light semantics:** BH1750 measures illuminance in lux, which is weighted for the human eye, not PAR. The thresholds
-  are approximate guidance from extension services that also use foot-candles [50][54].
-- **Local Supabase from pg_cron:** inside the local Docker stack the Edge Function URL in Vault must point at the
-  function from the DB container (e.g. `http://host.docker.internal:54321`). The T3 implementer must verify this.
+**Risks:**
+- **R1 Free-project pause.** A Free project pauses after 7 days of low activity [29]. The gateway heartbeat prevents
+  this while the Pi is online. If the Pi is off for more than a week, restore the project from the Supabase
+  dashboard.
+- **R2 Pi clock.** The Pi has no RTC [7]. The backfill logic in §5.4 mitigates this. An optional DS3231 RTC module
+  would remove the risk.
+- **R3 SD-card corruption.** Mitigated by a good SD card, `synchronous=FULL` and a journald size cap [24][25].
+  **There are no backups by decision**, so a lost Supabase project means lost history.
+- **R4 Supabase platform changes.** Legacy API keys are being removed [8], and new tables no longer get default
+  grants [11]. The plan uses only the new keys and explicit grants.
+- **R5 DeepSeek.**
+  - Thinking is on by default and must be disabled [41].
+  - Models and prices change often [38], so `DEEPSEEK_MODEL` is configurable.
+  - The daily cap of 200 messages bounds the cost at about $9/month in the worst case.
+- **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration. If the probe is moved
+  to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the
+  upgrade path after v1.
+- **R7 Soil thresholds.** The 20/35/85/90% values are heuristics, because no extension source gives sensor
+  percentages. They can be tuned through `plants.threshold_overrides` without a deploy.
+- **R8 Light.** The BH1750 measures illuminance in lux, not PAR. The thresholds are approximate conversions from
+  extension guidance written in foot-candles [50][54].
+- **R9 Firmware QoS.** QoS 1 publishing needs `esp-mqtt` or an equivalent client; `PubSubClient` only publishes
+  QoS 0 [26].
+- **R10 Local dev quirk.** The Edge Function must reach the DeepSeek stub from inside Docker. For local tests, set
+  `DEEPSEEK_BASE_URL=http://host.docker.internal:<port>`.
