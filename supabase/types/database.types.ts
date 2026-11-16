@@ -207,6 +207,20 @@ isOneToOne: false
       referencedColumns: ["device_id"]
     }
                   ]
+                },"rollup_late_checked": {
+                  Row: {
+                    "reading_id": number
+                  }
+                  ComputedFields: never
+                  Insert: {
+                    "reading_id": number
+                  }
+                  Update: {
+                    "reading_id"?: number
+                  }
+                  Relationships: [
+                    
+                  ]
                 },"rollup_seals": {
                   Row: {
                     "device_id": string,"late_rows_ignored": number,"sealed_before": string
@@ -371,6 +385,9 @@ isOneToOne: false
                            },
 "rollup_catch_up":
 { Args: Record<PropertyKey, never>; Returns: undefined
+                           },
+"rollup_count_late":
+{ Args: { "p_after": string,"p_until": string }; Returns: undefined
                            },
 "rollup_write_daily":
 { Args: { "p_days": (string)[],"p_device_ids": (string)[] }; Returns: number
