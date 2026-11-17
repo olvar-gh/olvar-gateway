@@ -1,0 +1,106 @@
+# Runbook: operating the Pi gateway
+
+Commands run on the Pi over SSH (`ssh <pi-user>@olvar-gw.local`) unless they say otherwise. First-time setup is in
+[DEPLOY.md](DEPLOY.md).
+
+## Health check
+
+```sh
+systemctl status mosquitto olvar-gateway --no-pager
+sudo -u olvar /opt/olvar-gateway/venv/bin/python -m olvar_gateway status
+journalctl -u olvar-gateway --since "1 hour ago" --no-pager
+timedatectl | grep synchronized
+```
+
+| What you see | Meaning | What to do |
+|---|---|---|
+| `queue_depth` grows, `last_error` mentions 401/403/`42501` | the secret key was deleted or rotated | create a new `gateway` key (DEPLOY.md A3), put it in `gateway.env`, restart |
+| `last_error` mentions 404 or `PGRST` | migrations missing on the project | `supabase db push --remote` on your computer (DEPLOY.md A5) |
+| `heartbeat failed: network …` | no internet or the Supabase project is paused | check the Pi's network; in the dashboard, **Restore project** if it is paused (Free projects pause after 7 days without activity) |
+| `dead_letters` above 0 | some readings were rejected by the database | `journalctl -u olvar-gateway | grep dead` shows why; they are kept in the outbox file, not uploaded |
+| `System clock synchronized: no` | no NTP yet | readings are held and stamped once the clock syncs; check the network |
+| gateway `inactive (dead)` with `status=2` | invalid `gateway.env` | run the `--check-config` command from DEPLOY.md B6 and fix what it lists |
+
+Readings are never lost while Supabase is unreachable: the outbox at `/var/lib/olvar-gateway/outbox.db` holds up to
+100,000 readings (about 70 days for one device) and uploads them when the connection is back.
+
+## Restart, stop, logs
+
+```sh
+sudo systemctl restart olvar-gateway
+sudo systemctl stop olvar-gateway
+journalctl -u olvar-gateway -f
+journalctl -u mosquitto -f
+```
+
+Logs are capped at 50 MB in total.
+
+## Update to a new release
+
+```sh
+cd ~/olvar-gateway
+sudo deploy/update.sh <tag>
+```
+
+See "Updating later" in DEPLOY.md for the Supabase side.
+
+## Change an MQTT password
+
+Never add `-c`: it would erase every other user.
+
+```sh
+sudo mosquitto_passwd /etc/mosquitto/passwd <username>
+sudo chown mosquitto:mosquitto /etc/mosquitto/passwd
+sudo chmod 0600 /etc/mosquitto/passwd
+sudo systemctl restart mosquitto
+```
+
+For `olvar-gateway`, also update `MQTT_PASSWORD` in `/etc/olvar-gateway/gateway.env` and
+`sudo systemctl restart olvar-gateway`. For the ESP32, also enter the new password in its setup.
+
+## Rotate the Supabase secret key
+
+1. Dashboard → **Project Settings → API Keys → Secret keys**: create a new key (for example `gateway-2`).
+2. Put it in `SUPABASE_SECRET_KEY` in `/etc/olvar-gateway/gateway.env` and `sudo systemctl restart olvar-gateway`.
+3. Check `status` shows `last_error: none`, then delete the old key in the dashboard.
+
+## Replace the ESP32
+
+v1 links exactly one device to the plant. On your computer or in the dashboard's **SQL Editor**, unlink the old one
+(this keeps its history):
+
+```sql
+update public.devices set plant_id = null where id = '<old-device-id>';
+```
+
+Then, on the Pi, run `tools/setup_plant.py` with the new `--device-id` (DEPLOY.md B8), create its MQTT user
+(DEPLOY.md B9) and remove the old one:
+
+```sh
+sudo mosquitto_passwd -D /etc/mosquitto/passwd <old-device-id>
+sudo systemctl restart mosquitto
+```
+
+Calibrate the new probe in the app's Soil calibration screen.
+
+## The Pi moved to a different network
+
+The firewall allows MQTT only from the subnet detected at install time. Re-run the installer; it detects the new
+subnet (or pass it with `OLVAR_LAN_SUBNET=192.168.1.0/24`):
+
+```sh
+cd ~/olvar-gateway
+sudo deploy/install.sh
+```
+
+## Change the DeepSeek key
+
+On your computer, in the linked checkout:
+
+```sh
+printf 'DeepSeek API key: '; read -rs DEEPSEEK_API_KEY; echo
+supabase secrets set DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
+unset DEEPSEEK_API_KEY
+```
+
+The chat function picks up the new value on its next request.
