@@ -8,6 +8,7 @@ heartbeat). They share only the outbox and a small dict of pending device update
 from __future__ import annotations
 
 import logging
+import random
 import re
 import threading
 import time
@@ -32,6 +33,8 @@ from .models import (
 )
 from .mqtt_client import MessageHandler, MqttClient
 from .uploader import (
+    BACKOFF_MAX_S,
+    BACKOFF_MIN_S,
     DEVICES_PATH,
     MERGE_DUPLICATES,
     SupabaseWriter,
@@ -147,6 +150,8 @@ class Service:
         self._readings = DeviceFirstWriter(writer)
         uploader_options = {"rng": rng} if rng is not None else {}
         self._uploader = Uploader(outbox, self._readings, clock, **uploader_options)
+        self._rng = rng or random.random
+        self._device_failures = 0
         self._heartbeat_s = heartbeat_s
         self._mono = monotonic
         self._sleep = sleep
@@ -259,25 +264,44 @@ class Service:
         """
         until_heartbeat = self._maybe_heartbeat()
         if self._mono() >= self._upload_due:
-            self._flush_devices()
+            devices_failed = self._flush_devices()
             delay = self._uploader.step()
+            if devices_failed:
+                self._device_failures += 1
+                readings_delay = delay if self._uploader.backing_off else 0.0
+                delay = max(readings_delay, self._device_backoff())
+            else:
+                self._device_failures = 0
             self._upload_due = self._mono() + delay
         return max(0.0, min(self._upload_due - self._mono(), until_heartbeat))
 
-    def _flush_devices(self, deadline: float | None = None) -> None:
+    @property
+    def _backing_off(self) -> bool:
+        return self._uploader.backing_off or self._device_failures > 0
+
+    def _device_backoff(self) -> float:
+        exponent = min(self._device_failures - 1, 16)
+        base = min(BACKOFF_MAX_S, BACKOFF_MIN_S * 2**exponent)
+        return max(BACKOFF_MIN_S, base * (0.5 + 0.5 * self._rng()))
+
+    def _flush_devices(self, deadline: float | None = None) -> bool:
+        """Send pending device updates. True if one failed and must be retried later."""
         with self._pending_lock:
             pending, self._pending = self._pending, {}
+        failed = False
         for device_id, fields in pending.items():
-            unsent = self._send_device(device_id, fields, deadline)
+            unsent, part_failed = self._send_device(device_id, fields, deadline)
+            failed = failed or part_failed
             if unsent:
                 with self._pending_lock:
                     self._pending[device_id] = _merge(unsent, self._pending.get(device_id, {}))
+        return failed
 
     def _send_device(
         self, device_id: str, fields: dict[str, Any], deadline: float | None
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], bool]:
         """Status and last-seen go as separate requests so neither dates the other.
-        Returns the fields still to send."""
+        Returns the fields still to send and whether a request failed."""
         parts: list[tuple[dict[str, Any], Callable[[], UploadResult]]] = []
         if "status" in fields:
             status = {k: fields[k] for k in ("status", "status_changed_at")}
@@ -293,6 +317,7 @@ class Service:
         if seen:
             parts.append((seen, lambda: self._writer.upsert_device(device_id, **seen)))
         unsent: dict[str, Any] = {}
+        failed = False
         for part, send in parts:
             if deadline is not None and self._mono() >= deadline:
                 unsent.update(part)
@@ -300,11 +325,12 @@ class Service:
             result = send()
             if result.outcome == "retryable":
                 unsent.update(part)
+                failed = True
             elif result.ok:
                 self._readings.confirm(device_id)
             else:
                 log.error("device %s update rejected: %s", device_id, result.describe())
-        return unsent
+        return unsent, failed
 
     def _maybe_heartbeat(self) -> float:
         now = self._mono()
@@ -338,7 +364,7 @@ class Service:
                     break
                 self._wake.clear()
                 # A new row must not cut a backoff short, or a down Supabase gets one call per row.
-                if not self._uploader.backing_off:
+                if not self._backing_off:
                     self._upload_due = 0.0
                     break
 

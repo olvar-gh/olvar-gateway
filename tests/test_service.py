@@ -749,6 +749,33 @@ def test_heartbeat_retries_do_not_shorten_readings_backoff(make_service, server,
     assert len([p for _, p in server.attempts if p == "/rest/v1/gateways"]) >= 20
 
 
+def test_failed_status_only_update_backs_off_like_readings(make_service, server, fake_time):
+    server.clock = fake_time
+    server.down_paths = {"/rest/v1/devices"}
+    service = make_service()
+    service.handle_message(STATUS_TOPIC, b"offline")
+    start = fake_time.now
+    while fake_time.now - start < 1500:
+        fake_time.now += max(service.tick(), 0.001)
+    times = [t - start for t, p in server.attempts if p == "/rest/v1/devices"]
+    gaps = [b - a for a, b in itertools.pairwise(times)]
+    assert gaps[:3] == [1, 2, 4]
+    assert gaps == sorted(gaps)
+    assert gaps[-1] == 300
+
+    server.down_paths = set()
+    fake_time.now += service.tick()
+    service.tick()
+    assert server.bodies("/rest/v1/devices") == [
+        {"id": DEVICE, "status": "offline", "status_changed_at": T0.isoformat()}
+    ]
+    service.handle_message(STATUS_TOPIC, b"online")
+    assert service.tick() <= 5
+    fake_time.now += 5
+    service.tick()
+    assert server.bodies("/rest/v1/devices")[-2]["status"] == "online"
+
+
 def test_flush_never_overruns_its_deadline_on_a_hung_supabase(tmp_path, server, sync_flag):
     clock = Clock(sync_flag=sync_flag, boot_id="pi-boot", wall=lambda: T0, mono_ns=lambda: 0)
     outbox = Outbox(tmp_path / "outbox.db", now=lambda: T0)
