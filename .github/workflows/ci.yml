@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI never deploys: production deploys are the manual `--remote` steps in docs/PLAN.md §7.
+jobs:
+  gateway:
+    name: Gateway (ruff + pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest
+
+  database:
+    name: Database (pgTAP + generated types)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Exact version: `gen types` output can change between CLI releases, and the committed file must match it.
+      - uses: supabase/setup-cli@v3
+        with:
+          version: 3.1.0
+      - run: supabase start -x studio,imgproxy,vector,logflare,mailpit,edge-runtime
+      - run: supabase db reset --local
+      - run: supabase test db --local
+      - name: Committed types match the migrations
+        run: |
+          supabase gen types --lang typescript --local > "$RUNNER_TEMP/database.types.ts"
+          if ! diff -u supabase/types/database.types.ts "$RUNNER_TEMP/database.types.ts"; then
+            echo "::error file=supabase/types/database.types.ts::Out of date. Regenerate with: supabase gen types --lang typescript --local > supabase/types/database.types.ts"
+            exit 1
+          fi
+
+  chat-function:
+    name: Chat function (deno test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2.0.5
+        with:
+          deno-version: v2.x
+      - run: deno test --allow-net=127.0.0.1 supabase/functions/chat
