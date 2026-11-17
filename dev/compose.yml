@@ -1,0 +1,64 @@
+# Local development and tests only. Production uses the Mosquitto on the Pi (deploy/mosquitto)
+# and the hosted Supabase project; the local Supabase stack comes from `supabase start`.
+#
+#   docker compose -f dev/compose.yml up -d
+#
+# Every user below shares OLVAR_DEV_MQTT_PASSWORD. Auth and the ACL mirror docs/PLAN.md §5.5, so
+# a device can still write only its own topics.
+name: olvar-dev
+
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0.22
+    ports:
+      - "127.0.0.1:${OLVAR_DEV_MQTT_PORT:-1883}:1883"
+    environment:
+      OLVAR_DEV_MQTT_PASSWORD: ${OLVAR_DEV_MQTT_PASSWORD:-olvar-dev}
+      OLVAR_DEV_MQTT_USERS: >-
+        olvar-gateway olvar-a1b2c3 olvar-e2e-happy olvar-e2e-outage olvar-e2e-restart
+        olvar-e2e-spoof olvar-e2e-victim olvar-fake
+    configs:
+      - source: olvar_conf
+        target: /mosquitto/config/mosquitto.conf
+      - source: olvar_acl
+        target: /mosquitto/config/acl
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        umask 077
+        rm -f /mosquitto/data/passwd
+        for user in $$OLVAR_DEV_MQTT_USERS; do
+          [ -f /mosquitto/data/passwd ] || touch /mosquitto/data/passwd
+          mosquitto_passwd -b /mosquitto/data/passwd "$$user" "$$OLVAR_DEV_MQTT_PASSWORD"
+        done
+        cp /mosquitto/config/acl /mosquitto/data/acl
+        chown mosquitto:mosquitto /mosquitto/data/passwd /mosquitto/data/acl
+        exec mosquitto -c /mosquitto/config/mosquitto.conf
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          mosquitto_sub -h 127.0.0.1 -u olvar-gateway -P "$$OLVAR_DEV_MQTT_PASSWORD"
+          -t '$$SYS/broker/uptime' -C 1 -W 3
+      interval: 2s
+      timeout: 5s
+      retries: 15
+
+configs:
+  olvar_conf:
+    content: |
+      listener 1883 0.0.0.0
+      allow_anonymous false
+      password_file /mosquitto/data/passwd
+      acl_file /mosquitto/data/acl
+      persistence false
+      log_dest stdout
+  olvar_acl:
+    content: |
+      pattern write olvar/v1/%u/telemetry
+      pattern write olvar/v1/%u/status
+      user olvar-gateway
+      topic read olvar/v1/+/telemetry
+      topic read olvar/v1/+/status
+      topic read $$SYS/#
