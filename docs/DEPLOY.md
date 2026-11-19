@@ -11,7 +11,7 @@ Daily operations (logs, updates, passwords, replacing a device) are in [RUNBOOK.
 
 ## What you need
 
-- A Supabase account that is a member of the **dm-supabase** organization.
+- A Supabase account and an organization to create the project in.
 - A DeepSeek account with some prepaid credit (platform.deepseek.com).
 - A Raspberry Pi 3B, a good microSD card (16 GB or more, A1/A2 class), the official 5 V 2.5 A power supply.
 - The ESP32 plant sensor, flashed with the Olvar firmware, and a USB cable to read its serial log.
@@ -50,11 +50,11 @@ The version must start with `3.`. If it starts with `2.`, run `brew upgrade supa
 In CLI v3, database commands work on your *local* copy unless you add `--remote`. Every command below that
 changes the hosted project asks "Do you want to continue?" with **No** as the default: type `y` and press Enter.
 
-### A2. Create the project in the dm-supabase organization
+### A2. Create the project in your organization
 
 1. Open https://supabase.com/dashboard and sign in.
 2. Click **New project**.
-3. **Organization:** choose **dm-supabase**.
+3. **Organization:** choose your organization.
 4. **Project name:** `olvar`.
 5. **Database password:** click **Generate a password**, copy it and save it.
 6. **Region:** the one closest to you.
@@ -82,7 +82,7 @@ cd olvar-gateway
 supabase login
 ```
 
-`supabase login` opens a browser window; approve it. Then check that the CLI sees your project in the dm-supabase
+`supabase login` opens a browser window; approve it. Then check that the CLI sees your project in your
 organization:
 
 ```sh
@@ -90,7 +90,7 @@ supabase orgs list
 supabase projects list
 ```
 
-Find the row named `olvar` whose organization is **dm-supabase**, and use its reference id:
+Find the row named `olvar` whose organization is yours, and use its reference id:
 
 ```sh
 supabase link --project-ref <project-ref>
@@ -197,22 +197,12 @@ In your router's settings, give the Pi a **DHCP reservation** (a fixed IP addres
 
 ### B3. Download the gateway
 
-The repository is private, so the Pi needs a read-only GitHub token:
-
-1. On GitHub: **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token**.
-2. Name `olvar-gw`, Resource owner **olvar-gh**, Repository access **Only select repositories → olvar-gateway**,
-   Permissions → Repository → **Contents: Read-only**. Generate and copy it.
-
 On the Pi:
 
 ```sh
 sudo apt install -y git
-git config --global credential.helper store
 git clone https://github.com/olvar-gh/olvar-gateway.git ~/olvar-gateway
 ```
-
-Username: your GitHub username. Password: paste the token. Git saves it in `~/.git-credentials` so that updates
-work later.
 
 ### B4. Install
 

@@ -42,5 +42,10 @@ commit.
 
 ## Deploying
 
-CI never deploys. Production deploys are manual (`supabase db push --remote`, `supabase functions deploy chat`);
-see docs/PLAN.md §7.
+CI never deploys. Production deploys are manual (`supabase db push --remote`, `supabase functions deploy chat`).
+The step-by-step guide for Supabase and the Raspberry Pi is [docs/DEPLOY.md](docs/DEPLOY.md); daily operations are
+in [docs/RUNBOOK.md](docs/RUNBOOK.md).
+
+## License
+
+[MIT](LICENSE)
