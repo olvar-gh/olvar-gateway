@@ -1,6 +1,6 @@
 import { anchoredHistory, buildContextBlock, type ChatRow, fallbackReply, type PlantContext } from "./context.ts";
-import { completeWithRetry, type DeepSeekConfig, DeepSeekError } from "./deepseek.ts";
-import { buildMessages } from "./prompt.ts";
+import { AnthropicError, type AnthropicConfig, completeWithRetry } from "./anthropic.ts";
+import { buildPrompt } from "./prompt.ts";
 
 export const MAX_MESSAGE_CHARS = 1000;
 
@@ -38,7 +38,7 @@ export interface Deps {
   store: Store;
   /** Returns the user id (JWT `sub`) of a valid user token, else null. */
   verifyUser(jwt: string): Promise<string | null>;
-  deepseek: DeepSeekConfig;
+  anthropic: AnthropicConfig;
   now?: () => Date;
   log?: (event: Record<string, unknown>) => void;
 }
@@ -105,7 +105,7 @@ export function createHandler(deps: Deps): (req: Request) => Promise<Response> {
       deps.store.loadContext(plantId, at),
       deps.store.loadHistory(plantId, admitted.id),
     ]);
-    const messages = buildMessages(
+    const prompt = buildPrompt(
       ctx.nickname,
       buildContextBlock({ ...ctx, now: at }),
       anchoredHistory(rows, admitted),
@@ -119,11 +119,11 @@ export function createHandler(deps: Deps): (req: Request) => Promise<Response> {
 
     let reply: NewReply;
     try {
-      const c = await completeWithRetry(deps.deepseek, messages);
+      const c = await completeWithRetry(deps.anthropic, prompt);
       reply = { ...base, content: c.content, model: c.model, tokens_in: c.tokensIn, tokens_out: c.tokensOut, error: null };
     } catch (e) {
-      const error = e instanceof DeepSeekError ? e.message : `unexpected: ${(e as Error).message}`;
-      log({ event: "deepseek_failed", plant_id: plantId, message_id: admitted.id, error });
+      const error = e instanceof AnthropicError ? e.message : `unexpected: ${(e as Error).message}`;
+      log({ event: "anthropic_failed", plant_id: plantId, message_id: admitted.id, error });
       reply = { ...base, content: fallbackReply(ctx.status), model: null, tokens_in: null, tokens_out: null, error };
     }
 

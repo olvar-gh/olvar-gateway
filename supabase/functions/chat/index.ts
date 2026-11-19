@@ -1,5 +1,5 @@
 import { createClient } from "npm:@supabase/supabase-js@2.119.0";
-import { deepSeekConfigFromEnv } from "./deepseek.ts";
+import { anthropicConfigFromEnv } from "./anthropic.ts";
 import { createHandler, withErrorBoundary } from "./handler.ts";
 import { SupabaseStore } from "./store.ts";
 
@@ -27,7 +27,7 @@ const handler = createHandler({
     if (error || !data?.claims?.sub || data.claims.role !== "authenticated") return null;
     return data.claims.sub;
   },
-  deepseek: deepSeekConfigFromEnv(Deno.env),
+  anthropic: anthropicConfigFromEnv(Deno.env),
 });
 
 Deno.serve(withErrorBoundary(handler));

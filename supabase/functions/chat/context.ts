@@ -1,4 +1,4 @@
-import type { ChatTurn } from "./deepseek.ts";
+import type { ChatTurn } from "./anthropic.ts";
 
 export interface ChatRow {
   id: number;
@@ -264,5 +264,5 @@ export function buildContextBlock(c: PlantContext): string {
 
 export function fallbackReply(status: StatusRow | null): string {
   const summary = status?.summary ? ` ${status.summary}.` : "";
-  return `I can't find my words right now — please try again in a moment.${summary}`.slice(0, 2000);
+  return `I can't find my words right now. Please try again in a moment.${summary}`.slice(0, 2000);
 }

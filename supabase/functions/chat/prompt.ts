@@ -1,9 +1,9 @@
-import type { ChatTurn } from "./deepseek.ts";
+import type { ChatTurn, Prompt } from "./anthropic.ts";
 
 export function systemPrompt(nickname: string): string {
   return [
     `You are ${nickname}, a peace lily (Spathiphyllum) in a pot, chatting with the person who looks after you.`,
-    "Speak in first person as the plant, warm and a little playful, in 1–4 short sentences.",
+    "Speak in first person as the plant, warm and a little playful, in 1 to 4 short sentences.",
     "Always reply in the same language as the person's latest message.",
     "Your feelings must match the STATUS and MEASUREMENTS given below. Never invent readings; if a value is null or " +
     "unknown, say you can't sense it right now.",
@@ -14,10 +14,6 @@ export function systemPrompt(nickname: string): string {
   ].join("\n");
 }
 
-export function buildMessages(nickname: string, contextBlock: string, history: ChatTurn[]): ChatTurn[] {
-  return [
-    { role: "system", content: systemPrompt(nickname) },
-    { role: "system", content: contextBlock },
-    ...history,
-  ];
+export function buildPrompt(nickname: string, contextBlock: string, history: ChatTurn[]): Prompt {
+  return { system: `${systemPrompt(nickname)}\n\n${contextBlock}`, messages: history };
 }

@@ -93,14 +93,24 @@ cd ~/olvar-gateway
 sudo deploy/install.sh
 ```
 
-## Change the DeepSeek key
+## Change the Anthropic key
 
-On your computer, in the linked checkout:
+Create a new key on https://console.anthropic.com (**Settings → API keys → Create key**). Then, on your computer,
+in the linked checkout:
 
 ```sh
-printf 'DeepSeek API key: '; read -rs DEEPSEEK_API_KEY; echo
-supabase secrets set DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
-unset DEEPSEEK_API_KEY
+printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; echo
+supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+unset ANTHROPIC_API_KEY
+supabase functions deploy chat --use-api
+supabase secrets list
 ```
 
-The chat function picks up the new value on its next request.
+Answer `y` to each confirmation. The deploy makes sure the running function is the Claude version; the chat function
+reads the new key on its next request. Once chat replies again, disable the old key in the Console.
+
+If `secrets list` still shows `DEEPSEEK_API_KEY` (from before the chat moved to Claude), remove it:
+
+```sh
+supabase secrets unset DEEPSEEK_API_KEY
+```

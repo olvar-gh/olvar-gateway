@@ -1,4 +1,4 @@
-# olvar-gateway — Project plan (v1, final contract)
+# olvar-gateway: Project plan (v1, final contract)
 
 Scope of this repo:
 - the Raspberry Pi gateway service (MQTT → validate → durable buffer → Supabase);
@@ -42,11 +42,11 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - The Supabase Edge Function **`chat`** is called by the signed-in owner.
   - It stores the user's message through an **atomic quota check** (`chat_admit`), so concurrent requests cannot
     exceed the limits.
-  - It gives DeepSeek **`deepseek-flash`** (thinking off) a context of plant profile, thresholds, `plant_status_v`,
+  - It gives Claude Haiku 5.5 **`claude-haiku-5-5`** (Anthropic Messages API, thinking off) a context of plant profile, thresholds, `plant_status_v`,
     the latest reading, 24 h and 7 d summaries, and the last 10 completed question/answer pairs before this message.
   - It stores the reply and returns it. The plant answers in first person, in the language of the user's message.
-  - The DeepSeek key exists only in Edge Function secrets.
-  - Cost is about **$0.002 per message** at peak price.
+  - The Anthropic API key (`ANTHROPIC_API_KEY`) exists only in Edge Function secrets.
+  - Cost is about **$0.0006 per message**.
 - **Data volume and retention:** 1,440 readings a day is about 0.3 MB/day. Raw readings are kept for **90 days**.
   **Hourly and daily summaries** are built by pg_cron, which resumes from a persisted watermark and keeps
   per-metric sample counts.
@@ -59,7 +59,7 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - Mosquitto in Docker;
   - `supabase start` for the full local stack;
   - pgTAP for RLS, the status rules and rollups;
-  - `deno test` with a DeepSeek stub;
+  - `deno test` with an Anthropic API stub;
   - pytest for the gateway.
 
 ---
@@ -127,7 +127,7 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - 200 concurrent Realtime connections;
   - unlimited API requests [29][30][31].
 - **Edge Function limits:** 150 s wall clock on the Free plan, **2 s CPU per request**, and 256 MB of memory [32].
-  Waiting on DeepSeek's response is async I/O and does not count toward the CPU limit.
+  Waiting on the Anthropic API's response is async I/O and does not count toward the CPU limit.
 - **Edge Function authentication** [33]:
   - Functions can require a **user JWT**, which is the default behaviour (`verify_jwt`).
   - The `@supabase/server` `withSupabase` wrapper provides per-request clients.
@@ -145,49 +145,42 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - `supabase gen types --lang typescript` generates the types;
   - `supabase functions serve --env-file` runs Edge Functions locally.
 
-### 2.5 DeepSeek API (verified 2026-11-16)
-- **The model id is exactly `deepseek-flash`.**
-  - It currently serves DeepSeek-V4.1-Flash-1017 [38][39][40].
-  - The legacy names `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` are routed to it.
-  - The other model is `deepseek-v4-pro`.
-- The base URL is `https://api.deepseek.com` (OpenAI-compatible format) [40].
-- **`deepseek-flash` prices per 1M tokens:**
-
-  | | Off-peak | Peak |
-  |---|---|---|
-  | Input, cache hit | $0.003 | $0.006 |
-  | Input, cache miss | $0.15 | $0.30 |
-  | Output | $0.60 | $1.20 |
-
-  Peak hours are 01:00–04:00 and 06:00–10:00 UTC on weekdays. All other hours are billed at half price [39].
-- **Thinking mode is on by default.** Disable it with `{"thinking": {"type": "disabled"}}`. In thinking mode,
-  `temperature` is ignored [41].
-- JSON Output mode exists but can return blank content [42][43]. Chat replies are plain text, so `chat` does not use
-  JSON mode.
-- Rate limiting is by concurrency: 2,500 concurrent requests for flash, then **HTTP 429** [44].
+### 2.5 Anthropic Messages API (verified 2026-11-20; replaced DeepSeek)
+- **The model id is exactly `claude-haiku-5-5`** (Claude Haiku 5.5, the current Haiku) [38][39].
+- Requests are `POST https://api.anthropic.com/v1/messages` with the headers `x-api-key` and `anthropic-version`
+  (`2026-10-21`) [40][43].
+- The system prompt goes in the top-level `system` field; `messages` holds only `user` and `assistant` turns, starting
+  with `user` [40][43].
+- **Claude Haiku 5.5 prices per 1M tokens** (prompts up to 100K tokens): input $0.10, output $0.50 [39].
+- **Thinking is on by default.** `{"thinking": {"type": "disabled"}}` is accepted at effort `high` or below; `chat`
+  sends it with `output_config.effort` `low` [41].
+- On API version `2026-10-21`, `temperature`, `top_p` and `top_k` are rejected with HTTP 400, so `chat` sends none of
+  them [42].
+- A reply ends with `stop_reason`; `refusal` means a safety decline, which is not retried [43].
+- Rate limits return **HTTP 429**; an overloaded API returns **529** [44].
 
 ### 2.6 Volume and Free-plan budget (estimates; check after 1 week with `pg_total_relation_size`)
 | Item | Per day | Per year | Free limit |
 |---|---|---|---|
 | Raw readings (1 device × 60 s) | 1,440 rows ≈ 0.3 MB incl. indexes | ≈ 110 MB (90-day steady state ≈ 27 MB) | 500 MB DB |
 | Hourly + daily rollups | 25 rows | ≈ 2 MB | |
-| PostgREST writes (1/reading + heartbeat) | ≈ 1,700 | — | unlimited [29] |
+| PostgREST writes (1/reading + heartbeat) | ≈ 1,700 | n/a | unlimited [29] |
 | Realtime messages (2 open clients) | ≈ 3,000 | ≈ 90k/month | 2M/month [30] |
-| `chat` invocations | user-driven, capped at 200/day (§5.7) | — | 500k/month |
+| `chat` invocations | user-driven, capped at 200/day (§5.7) | n/a | 500k/month |
 
-### 2.7 DeepSeek cost per chat message
+### 2.7 Claude cost per chat message
 - **Tokens per call:**
-  - a static system prompt of about 700 tokens (a cacheable prefix);
+  - a static system prompt of about 700 tokens;
   - plant context of about 1,200 tokens;
   - history of the last 10 completed question/answer pairs, about 1,600 tokens;
   - the user's message;
-  - total about **3,600 input tokens**, plus at most **350 output tokens**.
-- **Worst case at peak with no cache hits:**
-  3,600 × $0.30/M + 350 × $1.20/M ≈ **$0.0015 per message**.
+  - total about **3,600 input tokens**, plus at most **400 output tokens**.
+- **Worst case with no cache hits:**
+  3,600 × $0.10/M + 400 × $0.50/M ≈ **$0.0006 per message**.
 - **Monthly estimates:**
-  - At 30 messages a day, about **$1.4/month** at worst. Off-peak hours and cache hits make it less.
-  - At the hard cap of 200 admitted messages a day, at most about **$9/month**. If every message also used its one
-    retry (400 calls a day), at most about **$18/month**.
+  - At 30 messages a day, about **$0.5/month** at worst.
+  - At the hard cap of 200 admitted messages a day, at most about **$3.4/month**. If every message also used its one
+    retry (400 calls a day), at most about **$6.7/month**.
 
 ### 2.8 Peace lily (Spathiphyllum) care thresholds
 Sources are university extension services. 1 fc = 10.764 lux.
@@ -210,66 +203,66 @@ Sources are university extension services. 1 fc = 10.764 lux.
   venv without Docker [58].
 
 ### 2.11 Sources
-1. Raspberry Pi OS downloads — https://www.raspberrypi.org/software/operating-systems
-2. Raspberry Pi OS documentation — https://www.raspberrypi.com/documentation/computers/os.html
-3. Trixie announcement and comments (Python 3.13) — https://www.raspberrypi.com/news/trixie-the-new-version-of-raspberry-pi-os
-4. 32 vs 64-bit RAM (cites Phoronix) — https://techexplorations.com/guides/rpi/begin/rpi-os-32bit-vs-64bit
-5. Pi 3B 32/64-bit discussion — https://groups.io/g/direwolf/topic/what_os_is_better_in_a_pi_3b/118524620
-6. systemd-timesyncd man page — https://www.freedesktop.org/software/systemd/man/latest/systemd-timesyncd.service.html
-7. Raspberry Pi forum, fake-hwclock behaviour — https://forums.raspberrypi.com/viewtopic.php?t=256726
-8. Supabase API keys — https://supabase.com/docs/guides/getting-started/api-keys
-9. Migrating to publishable/secret keys — https://supabase.com/docs/guides/getting-started/migrating-to-new-api-keys
-10. Supabase changelog, API keys — https://supabase.com/changelog/29260-upcoming-changes-to-supabase-api-keys
-11. Breaking change: tables not auto-exposed — https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically
-12. Mosquitto authentication methods — https://mosquitto.org/documentation/authentication-methods
-13. mosquitto.conf(5) (Debian testing) — https://manpages.debian.org/testing/mosquitto/mosquitto.conf.5.en.html
-14. mosquitto_passwd(1) — https://manpages.debian.org/unstable/mosquitto/mosquitto_passwd.1.en.html
-15. Mosquitto advanced configuration (conf.d, ACL, persistence) — https://cubepath.com/docs/home-automation-and-iot/mosquitto-mqtt-broker-advanced-configuration
-16. paho-mqtt on PyPI — https://pypi.org/project/paho-mqtt/2.2.0/
-17. paho-mqtt 2.x migration notes — https://testmqtt.com/learn/mqtt-python
-18. supabase on PyPI — https://pypi.org/project/supabase
-19. PostgREST tables/views (bulk insert, upsert) — https://docs.postgrest.org/en/latest/references/api/tables_views.html
-20. Supabase Python upsert — https://supabase.com/docs/reference/python/upsert
-21. Scheduling Edge Functions (apikey header usage) — https://supabase.com/docs/guides/functions/schedule-functions
-22. Supabase RLS — https://supabase.com/docs/guides/database/postgres/row-level-security
-23. RLS performance — https://supabase.com/docs/guides/database/postgres/row-level-security-performance
-24. Raspberry Pi whitepaper "Making a more resilient file system" — https://pip-assets.raspberrypi.com/categories/685-app-notes-guides-whitepapers/documents/RP-003610-WP-3-Making%20a%20more%20resilient%20file%20system.pdf
-25. SQLite PRAGMA synchronous — https://www.sqlite.org/pragma.html
-26. PubSubClient README (QoS 0 publish only) — https://github.com/knolleary/pubsubclient
-27. Realtime Postgres Changes — https://supabase.com/docs/guides/realtime/postgres-changes
-28. Realtime troubleshooting (RLS gates delivery) — https://supabase.com/docs/guides/troubleshooting/realtime-messages-not-arriving
-29. Supabase pricing — https://supabase.com/pricing
-30. Realtime limits — https://supabase.com/docs/guides/realtime/limits
-31. Free-plan disk and read-only behaviour (summarising Supabase docs) — https://fastero.com/blog/supabase-pricing
-32. Edge Function limits — https://supabase.com/docs/guides/functions/limits
-33. Securing Edge Functions — https://supabase.com/docs/guides/functions/auth
-34. Edge Function secrets/env — https://supabase.com/docs/guides/functions/secrets
-35. timescaledb deprecation — https://supabase.com/docs/guides/database/extensions/timescaledb
-36. Supabase CLI reference — https://supabase.com/docs/reference/cli/introduction
-37. Local development workflow — https://supabase.com/docs/guides/local-development/cli-workflows
-38. DeepSeek change log — https://api-docs.deepseek.com/updates
-39. DeepSeek Models & Pricing — https://api-docs.deepseek.com/quick_start/pricing
-40. DeepSeek first API call — https://api-docs.deepseek.com/
-41. DeepSeek Thinking Mode — https://api-docs.deepseek.com/guides/thinking_mode
-42. DeepSeek JSON Output — https://api-docs.deepseek.com/guides/json_mode
-43. DeepSeek Chat Completions API — https://api-docs.deepseek.com/api/create-chat-completion
-44. DeepSeek Rate Limit — https://api-docs.deepseek.com/quick_start/rate_limit
-45. Clemson HGIC, Peace Lily — https://hgic.clemson.edu/factsheet/peace-lily
-46. NC State Extension Plant Toolbox, Spathiphyllum — https://plants.ces.ncsu.edu/plants/spathiphyllum
-47. UF/IFAS EP161, Commercial production of interiorscape Spathiphyllum — https://edis.ifas.ufl.edu/en/publication/EP161
-48. UF/IFAS EP477, Florida Foliage House Plant Care: Spathiphyllum — https://ask.ifas.ufl.edu/en/publication/ep477
-49. SDSU Extension, Peace Lily — https://extension.sdstate.edu/peace-lily-houseplant-how
-50. UGA Extension B1318, Growing Indoor Plants with Success — https://fieldreport.caes.uga.edu/wp-content/uploads/2025/08/B-1318_6.pdf
-51. UT Extension W1128A, Selecting Indoor Plants — https://uthort.tennessee.edu/wp-content/uploads/sites/228/2023/11/W1128A.pdf
-52. MU Extension G6510, Caring for Houseplants — https://extension.missouri.edu/publications/g6510
-53. MU Extension G6515, Lighting Indoor Houseplants — https://extension.missouri.edu/publications/g6515
-54. UMD Extension, Lighting for Indoor Plants — https://extension.umd.edu/resource/lighting-indoor-plants
-55. SmartHomeScene, capacitive v1.2 + ESP32 calibration — https://smarthomescene.com/diy/diy-capacitive-soil-moisture-sensor-v1-2-with-esphome/
-56. esp32.co.uk, calibrate in real soil — https://esp32.co.uk/capacitive-soil-moisture-sensor-esp32-esphome-home-assistant
-57. Calibration guide (relative %, unit variance) — https://swiftwand.com/en/soil-moisture-sensor-esp32-calibration-2026-en
-58. Python app as a systemd service — https://johnthecomputerman.co.uk/kc/ls/how-to-run-a-python-app-as-a-service-without-docker-venv-systemd.html
-59. Supabase CLI v3 breaking change (local by default, `--remote`, confirmation) — https://supabase.com/changelog/supabase-cli-v3
-60. Supabase CLI reference: `db push` (`--remote`, `--include-seed`, `--yes`), `functions deploy`, `secrets` — https://supabase.com/docs/reference/cli/supabase-db-push
+1. Raspberry Pi OS downloads: https://www.raspberrypi.org/software/operating-systems
+2. Raspberry Pi OS documentation: https://www.raspberrypi.com/documentation/computers/os.html
+3. Trixie announcement and comments (Python 3.13): https://www.raspberrypi.com/news/trixie-the-new-version-of-raspberry-pi-os
+4. 32 vs 64-bit RAM (cites Phoronix): https://techexplorations.com/guides/rpi/begin/rpi-os-32bit-vs-64bit
+5. Pi 3B 32/64-bit discussion: https://groups.io/g/direwolf/topic/what_os_is_better_in_a_pi_3b/118524620
+6. systemd-timesyncd man page: https://www.freedesktop.org/software/systemd/man/latest/systemd-timesyncd.service.html
+7. Raspberry Pi forum, fake-hwclock behaviour: https://forums.raspberrypi.com/viewtopic.php?t=256726
+8. Supabase API keys: https://supabase.com/docs/guides/getting-started/api-keys
+9. Migrating to publishable/secret keys: https://supabase.com/docs/guides/getting-started/migrating-to-new-api-keys
+10. Supabase changelog, API keys: https://supabase.com/changelog/29260-upcoming-changes-to-supabase-api-keys
+11. Breaking change: tables not auto-exposed: https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically
+12. Mosquitto authentication methods: https://mosquitto.org/documentation/authentication-methods
+13. mosquitto.conf(5) (Debian testing): https://manpages.debian.org/testing/mosquitto/mosquitto.conf.5.en.html
+14. mosquitto_passwd(1): https://manpages.debian.org/unstable/mosquitto/mosquitto_passwd.1.en.html
+15. Mosquitto advanced configuration (conf.d, ACL, persistence): https://cubepath.com/docs/home-automation-and-iot/mosquitto-mqtt-broker-advanced-configuration
+16. paho-mqtt on PyPI: https://pypi.org/project/paho-mqtt/2.2.0/
+17. paho-mqtt 2.x migration notes: https://testmqtt.com/learn/mqtt-python
+18. supabase on PyPI: https://pypi.org/project/supabase
+19. PostgREST tables/views (bulk insert, upsert): https://docs.postgrest.org/en/latest/references/api/tables_views.html
+20. Supabase Python upsert: https://supabase.com/docs/reference/python/upsert
+21. Scheduling Edge Functions (apikey header usage): https://supabase.com/docs/guides/functions/schedule-functions
+22. Supabase RLS: https://supabase.com/docs/guides/database/postgres/row-level-security
+23. RLS performance: https://supabase.com/docs/guides/database/postgres/row-level-security-performance
+24. Raspberry Pi whitepaper "Making a more resilient file system": https://pip-assets.raspberrypi.com/categories/685-app-notes-guides-whitepapers/documents/RP-003610-WP-3-Making%20a%20more%20resilient%20file%20system.pdf
+25. SQLite PRAGMA synchronous: https://www.sqlite.org/pragma.html
+26. PubSubClient README (QoS 0 publish only): https://github.com/knolleary/pubsubclient
+27. Realtime Postgres Changes: https://supabase.com/docs/guides/realtime/postgres-changes
+28. Realtime troubleshooting (RLS gates delivery): https://supabase.com/docs/guides/troubleshooting/realtime-messages-not-arriving
+29. Supabase pricing: https://supabase.com/pricing
+30. Realtime limits: https://supabase.com/docs/guides/realtime/limits
+31. Free-plan disk and read-only behaviour (summarising Supabase docs): https://fastero.com/blog/supabase-pricing
+32. Edge Function limits: https://supabase.com/docs/guides/functions/limits
+33. Securing Edge Functions: https://supabase.com/docs/guides/functions/auth
+34. Edge Function secrets/env: https://supabase.com/docs/guides/functions/secrets
+35. timescaledb deprecation: https://supabase.com/docs/guides/database/extensions/timescaledb
+36. Supabase CLI reference: https://supabase.com/docs/reference/cli/introduction
+37. Local development workflow: https://supabase.com/docs/guides/local-development/cli-workflows
+38. Anthropic models overview: https://platform.claude.com/docs/en/about-claude/models/overview
+39. Anthropic pricing: https://platform.claude.com/docs/en/about-claude/pricing
+40. Anthropic Messages API: https://platform.claude.com/docs/en/api/messages
+41. Anthropic adaptive thinking and effort: https://platform.claude.com/docs/en/build-with-claude/effort
+42. Anthropic API versions: https://platform.claude.com/docs/en/api/versioning
+43. Anthropic handling stop reasons: https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+44. Anthropic errors and rate limits: https://platform.claude.com/docs/en/api/errors
+45. Clemson HGIC, Peace Lily: https://hgic.clemson.edu/factsheet/peace-lily
+46. NC State Extension Plant Toolbox, Spathiphyllum: https://plants.ces.ncsu.edu/plants/spathiphyllum
+47. UF/IFAS EP161, Commercial production of interiorscape Spathiphyllum: https://edis.ifas.ufl.edu/en/publication/EP161
+48. UF/IFAS EP477, Florida Foliage House Plant Care: Spathiphyllum: https://ask.ifas.ufl.edu/en/publication/ep477
+49. SDSU Extension, Peace Lily: https://extension.sdstate.edu/peace-lily-houseplant-how
+50. UGA Extension B1318, Growing Indoor Plants with Success: https://fieldreport.caes.uga.edu/wp-content/uploads/2025/08/B-1318_6.pdf
+51. UT Extension W1128A, Selecting Indoor Plants: https://uthort.tennessee.edu/wp-content/uploads/sites/228/2023/11/W1128A.pdf
+52. MU Extension G6510, Caring for Houseplants: https://extension.missouri.edu/publications/g6510
+53. MU Extension G6515, Lighting Indoor Houseplants: https://extension.missouri.edu/publications/g6515
+54. UMD Extension, Lighting for Indoor Plants: https://extension.umd.edu/resource/lighting-indoor-plants
+55. SmartHomeScene, capacitive v1.2 + ESP32 calibration: https://smarthomescene.com/diy/diy-capacitive-soil-moisture-sensor-v1-2-with-esphome/
+56. esp32.co.uk, calibrate in real soil: https://esp32.co.uk/capacitive-soil-moisture-sensor-esp32-esphome-home-assistant
+57. Calibration guide (relative %, unit variance): https://swiftwand.com/en/soil-moisture-sensor-esp32-calibration-2026-en
+58. Python app as a systemd service: https://johnthecomputerman.co.uk/kc/ls/how-to-run-a-python-app-as-a-service-without-docker-venv-systemd.html
+59. Supabase CLI v3 breaking change (local by default, `--remote`, confirmation): https://supabase.com/changelog/supabase-cli-v3
+60. Supabase CLI reference: `db push` (`--remote`, `--include-seed`, `--yes`), `functions deploy`, `secrets`: https://supabase.com/docs/reference/cli/supabase-db-push
 
 ---
 
@@ -285,7 +278,7 @@ Sources are university extension services. 1 fc = 10.764 lux.
 | D6 | **Gateway stamps `recorded_at`, but only from an NTP-synced clock** (§5.4) | The ESP32 has no clock and the Pi has no RTC [6][7] | Always trusting the Pi clock |
 | D7 | **`soil_pct` is computed in the database at read time** by `public.soil_pct(raw, dry, wet)` and exposed through `security_invoker` views. Only `soil_raw` is stored | One formula in one place. Recalibration takes effect immediately, including history and rollups, without rewriting rows. Before calibration the value is null | **Gateway computes on insert**: the gateway would need the calibration, and recalibrating would leave stale values or need a mass UPDATE that floods Realtime. **Trigger plus stored column**: same recalibration problem. **Per-calibration history applied by `recorded_at`**: more correct if the probe moves, but out of v1 scope (see R6) |
 | D8 | **Status pill = SQL view `plant_status_v`** (deterministic, no LLM) | Every client and the chat function read the same values. Testable with pgTAP | Client-side rules (clients could disagree); LLM-generated mood (contract A forbids it) |
-| D9 | **Chat = Edge Function `chat`**, non-streaming, `deepseek-flash` with thinking disabled, plain text output | The key stays server-side. A reply of ≤ 350 tokens arrives in a few seconds | Streaming (possible later); calling DeepSeek from the client (would expose the key); JSON mode (blank-output risk [42], not needed) |
+| D9 | **Chat = Edge Function `chat`**, non-streaming, Claude Haiku 5.5 (`claude-haiku-5-5`) through the Anthropic Messages API with thinking disabled, plain text output | The key stays server-side. A reply of ≤ 400 tokens arrives in a few seconds | Streaming (possible later); calling the Anthropic API from the client (would expose the key); structured JSON output (not needed). DeepSeek `deepseek-flash` was used until 2026-11-20 |
 | D10 | **Language follows the user's message** (instruction in the system prompt) | Contract A; no locale setting needed | A per-plant locale column |
 | D11 | **Plain tables + pg_cron rollups** | timescaledb is deprecated on PG17 [35] | Hypertables; materialized views |
 | D12 | **Realtime INSERT on `readings` acts as a signal; clients re-read from `readings_v`** | Realtime streams tables, not views [27], and `soil_pct` exists only in the views. This costs one small query per minute | Storing `soil_pct` (rejected in D7); client-side `soil_pct` math (two places) |
@@ -353,7 +346,7 @@ threshold logic.
   text such as "Feeling great").
 - Per-metric `<metric>_status`: one of `critical_low | low | ok | high | critical_high | unknown`, plus
   `<metric>_label` (e.g. "Too dry"), for temperature, humidity, light and soil.
-- `summary`: a deterministic one-line text such as "Soil is getting dry — water soon".
+- `summary`: a deterministic one-line text such as "Soil is getting dry, water soon".
 - `computed_at`, `latest_reading_at`, `issues` and `soil_calibrated`.
 - **Offline** means no reading for more than **180 s**, or a retained `offline` status. The dashboard uses the same
   180 s rule only to age its cached row between refetches.
@@ -408,7 +401,7 @@ ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
      pg_cron: :05 hourly → refresh_rollups (watermark) · 03:30 UTC → apply_retention (catch up, seal, delete raw > 90 d)
      fns:    device_offline_periods() (Timeline) · chat_admit() (atomic quota)
                          ▲                                   ▲
-   Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ DeepSeek deepseek-flash
+   Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ Anthropic claude-haiku-5-5
           └── Realtime: readings INSERT (signal), devices UPDATE, chat_messages INSERT
 ```
 
@@ -433,7 +426,7 @@ olvar-gateway/
 │   │   ├── 20261116000300_status.sql    # thresholds merge fn + plant_status_v
 │   │   └── 20261116000400_chat.sql      # chat_messages, grants, RLS, publication
 │   ├── tests/{core,rollups,status,chat}_test.sql   # pgTAP
-│   ├── functions/chat/{index.ts,context.ts,prompt.ts,deepseek.ts,*_test.ts}
+│   ├── functions/chat/{index.ts,context.ts,prompt.ts,anthropic.ts,*_test.ts}
 │   └── types/database.types.ts
 └── .github/workflows/ci.yml
 ```
@@ -535,7 +528,7 @@ password_file /etc/mosquitto/passwd
 acl_file /etc/mosquitto/acl
 ```
 ```conf
-# /etc/mosquitto/acl  — username == device_id
+# /etc/mosquitto/acl (username == device_id)
 pattern write olvar/v1/%u/telemetry
 pattern write olvar/v1/%u/status
 user olvar-gateway
@@ -777,7 +770,7 @@ select cron.schedule('olvar-retention', '30 3 * * *', $$select public.apply_rete
 --   issues text[]                                                    -- metric keys, worst first
 --   overall text  -- great | okay | needs_attention | in_trouble | offline | no_data
 --   overall_label text  -- 'Feeling great' | 'Doing okay' | 'Needs attention' | 'In trouble' | 'Offline' | 'No data yet'
---   summary text        -- one deterministic line from the worst issue, e.g. 'Soil is getting dry — water soon'
+--   summary text        -- one deterministic line from the worst issue, e.g. 'Soil is getting dry, water soon'
 --   computed_at timestamptz  -- now() at query time
 -- Rules (thresholds in §2.8):
 --   no reading ever → no_data;  latest reading > 180 s old or device_status = 'offline' → offline
@@ -831,7 +824,7 @@ create function public.chat_admit(p_owner_id uuid, p_plant_id uuid, p_content te
   --    (row lock: concurrent calls for the same plant queue here; not found → raise 'P0002' plant_not_found)
   -- 2. count role='user' rows for the plant in the last 5 min and the last 24 h
   -- 3. over 10 / 200 → raise exception using errcode = 'P0429', detail = retry_after seconds
-  -- 4. insert the 'user' row and return it — all in the same transaction as the lock
+  -- 4. insert the 'user' row and return it, all in the same transaction as the lock
 revoke execute on function public.chat_admit(uuid, uuid, text) from public, anon, authenticated;
 grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
 ```
@@ -846,7 +839,7 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
      inserts the user's row.
    - Concurrent requests therefore cannot both pass at 199/200, so the cost cap holds.
    - Error mapping: `P0429` returns HTTP 429 with `retry_after`; `P0002` returns 404.
-   - Each admitted message makes at most 2 DeepSeek calls (1 retry), so the worst case is 400 calls a day.
+   - Each admitted message makes at most 2 Anthropic API calls (1 retry), so the worst case is 400 calls a day.
 4. **Build the context:**
    - plant nickname and profile `care_notes`;
    - the effective thresholds;
@@ -863,15 +856,18 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
      - Turns therefore always alternate. The reply language follows `m.content`, never another request's message.
      - Overlapping requests never see each other's pending message as their own question.
      - The dashboard orders replies under their question with `reply_to`.
-5. **Call DeepSeek:**
-   - `POST https://api.deepseek.com/chat/completions` with `model:"deepseek-flash"`,
-     `thinking:{type:"disabled"}`, `max_tokens:350` and `temperature:0.7` [41][43].
-   - Timeout of 25 s; one retry on 429, 5xx or an empty reply.
-   - `DEEPSEEK_MODEL` and `DEEPSEEK_BASE_URL` can be overridden through env (the base URL is used for the test
-     stub).
+5. **Call Claude:**
+   - `POST https://api.anthropic.com/v1/messages` with headers `x-api-key: $ANTHROPIC_API_KEY` and
+     `anthropic-version: 2026-10-21`, and a body of `model:"claude-haiku-5-5"`, `max_tokens:400`, the system prompt
+     plus context in the top-level `system` field, the history in `messages`, `thinking:{type:"disabled"}` and
+     `output_config:{effort:"low"}` [40][41]. No `temperature` (rejected on this API version [42]).
+   - Timeout of 25 s; one retry on 429, 5xx (including 529), an empty reply or an unparseable body. A 4xx, a
+     timeout or a `refusal` stop reason is not retried.
+   - `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_TIMEOUT_MS` can be overridden through env (the base URL
+     is used for the test stub).
 6. **Store the reply** with `role='plant'`, `reply_to = m.id`, `based_on_reading_at` (the `recorded_at` of the latest reading in the
    context), the model name and the token usage, then return it.
-   - If DeepSeek fails, store and return a short deterministic fallback built from `plant_status_v`, with `error` set,
+   - If the Anthropic API call fails, store and return a short deterministic fallback built from `plant_status_v`, with `error` set,
      so the conversation never hangs.
 
 **System prompt (static prefix, so it can be cached):**
@@ -897,11 +893,11 @@ tests. Depending on what it touches, it must pass `uv run pytest`, `supabase tes
 
 | ID | Owner files | Depends on | Acceptance criteria | Verify (no hardware) |
 |---|---|---|---|---|
-| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `migrations/20261116000150_profile_spathiphyllum.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Profile migration:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources) as an idempotent upsert; pgTAP asserts that it exists after migrations alone (`supabase db reset --no-seed`) and that re-applying the SQL leaves one row. **Seed (local/test only):** a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; `timezone` updates to `Asia/Seol`, `UTC+3` or `''` fail with 22023 and leave the row unchanged, while `Asia/Seoul` succeeds; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
+| **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `migrations/20261116000150_profile_spathiphyllum.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | n/a | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Profile migration:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources) as an idempotent upsert; pgTAP asserts that it exists after migrations alone (`supabase db reset --no-seed`) and that re-applying the SQL leaves one row. **Seed (local/test only):** a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; `timezone` updates to `Asia/Seol`, `UTC+3` or `''` fail with 22023 and leave the row unchanged, while `Asia/Seoul` succeeds; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
 | **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. **Soil clamping:** with dry=3000, wet=1000 and raw {0, 3000}, `soil_pct_avg` = 50 %, which equals the mean of `readings_v.soil_pct` for the bucket; after a recalibration the two still agree. **Retention + late arrival:** a daily bucket built from temperatures {10, 30} (mean 20) is sealed by `apply_retention()`, which deletes the 10; a late reading of 30 is then inserted into that sealed day. The stored daily mean stays 20, the row is counted in `late_rows_ignored`, and the next retention run deletes it. `rebuild_rollups` skips sealed buckets without raising. `sealed_before` is hour-aligned, never moves backwards, and is correct for a +05:30 timezone. **Timezone change after a seal:** with a seal at `2026-08-18 00:00Z` in UTC, switching the plant to `Asia/Seoul` succeeds without error. It keeps sealed UTC day 2026-08-17 unchanged, rebuilds daily rows only from KST 2026-08-19 on, writes no 2026-08-18 row, and causes no primary-key collision. A switch from +14:00 to -12:00 also succeeds. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
 | **T3 Status view + offline periods** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status, labels and summary for every rule in §5.6, including `no_data`, `offline` (> 180 s), uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules. `device_offline_periods` returns: gaps > 180 s only; gaps clipped at the window edges; a gap spanning midnight in both days' results; `device_restart` when `boot_id` changes; `ongoing` for an open trailing gap; nothing for another owner's device (RLS); an error for a window > 7 days | Table-driven pgTAP with fixed `now()` via fixtures |
-| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. **Overlapping requests:** with fixtures where messages A then B are both admitted before either is answered, A's prompt ends with A as the final user turn, B's prompt excludes A (unanswered) and ends with B, every prompt alternates user/assistant, and each reply's `reply_to` points at its own question (`deno test` with the stub capturing request bodies). `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
-| **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
+| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. **Overlapping requests:** with fixtures where messages A then B are both admitted before either is answered, A's prompt ends with A as the final user turn, B's prompt excludes A (unanswered) and ends with B, every prompt alternates user/assistant, and each reply's `reply_to` points at its own question (`deno test` with the stub capturing request bodies). `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body goes to `/v1/messages` with `x-api-key`, `anthropic-version`, the top-level `system`, `thinking.type="disabled"` and `model="claude-haiku-5-5"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
+| **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | n/a | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
 | **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. Rows with `recorded_at` older than 89 days are dead-lettered as `beyond_retention`. The uploader handles 2xx, 5xx and network errors. **Classification:** a 401/403/`42501`/404/`PGRST*` response leaves every row queued with `last_error` set, and delivery resumes once the mock is fixed; a batch with one `23514` row dead-letters only that row (bisection). It sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
 | **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines. `python -m olvar_gateway status` prints the queue depth, dead-letter count and `last_error` | pytest with fakes; `python -m olvar_gateway --check-config` |
 | **T8 Fake device + E2E** | `tools/fake_esp32.py`, `dev/compose.yml`, `tests/e2e/**` | T7 | The fake device simulates a day/night lux curve, soil_raw drying and a watering jump (higher = drier), a reboot (new boot_id, seq reset), QoS 1 duplicates, garbage payloads, null sensors, `rssi_dbm`, and the LWT on SIGKILL. **E2E:** the happy path inserts N rows; Supabase down for 2 min loses nothing and creates no duplicates; a gateway restart loses nothing; a spoofed id is rejected; the LWT makes the device offline and `plant_status_v.overall = offline` | `docker compose -f dev/compose.yml up -d && supabase start && uv run pytest -m e2e` |
@@ -941,10 +937,11 @@ Only these need the real hardware:
    - **Disable sign-ups.**
    - Run `tools/setup_plant.py --owner-email … --device-id olvar-xxxxxx --timezone Area/City`. Take the device id
      from the ESP32 serial log.
-4. **DeepSeek:**
-   - Create an account at platform.deepseek.com and top up (prepaid).
+4. **Anthropic:**
+   - Create an account at console.anthropic.com and add credit (prepaid).
    - Create an API key.
-   - Run `supabase secrets set DEEPSEEK_API_KEY=…` and confirm; it targets the linked project [34][40][60].
+   - Run `supabase secrets set ANTHROPIC_API_KEY=…` and confirm; it targets the linked project [34][60]. If an old
+     `DEEPSEEK_API_KEY` secret exists, remove it with `supabase secrets unset DEEPSEEK_API_KEY`.
 5. **Raspberry Pi:**
    - Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager: hostname `olvar-gw`, user, SSH, Wi-Fi or
      Ethernet.
@@ -968,7 +965,7 @@ Only these need the real hardware:
 ## 8. Risks and open questions
 
 **Open questions:** none block v1. The 2026-11-16 contract settled all earlier questions (login, language,
-retention, DeepSeek use, MQTT encryption, backups).
+retention, LLM provider, MQTT encryption, backups).
 
 **Risks:**
 - **R1 Free-project pause.** A Free project pauses after 7 days of low activity [29]. The gateway heartbeat prevents
@@ -980,11 +977,11 @@ retention, DeepSeek use, MQTT encryption, backups).
   **There are no backups by decision**, so a lost Supabase project means lost history.
 - **R4 Supabase platform changes.** Legacy API keys are being removed [8], and new tables no longer get default
   grants [11]. The plan uses only the new keys and explicit grants.
-- **R5 DeepSeek.**
-  - Thinking is on by default and must be disabled [41].
-  - Models and prices change often [38], so `DEEPSEEK_MODEL` is configurable.
-  - The daily cap of 200 admitted messages is enforced atomically. It bounds the cost at about $9/month, or $18/month
-    if every call is retried.
+- **R5 LLM provider (Anthropic).**
+  - Thinking is on by default on Claude Haiku 5.5 and is disabled per request [41].
+  - Models and prices change [38], so `ANTHROPIC_MODEL` is configurable.
+  - The daily cap of 200 admitted messages is enforced atomically. It bounds the cost at about $3.4/month, or
+    $6.7/month if every call is retried.
 - **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration, including summaries
   and sealed buckets, through the stored `soil_raw` distributions. If the probe is moved
   to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the
@@ -998,5 +995,5 @@ retention, DeepSeek use, MQTT encryption, backups).
   extension guidance written in foot-candles [50][54].
 - **R9 Firmware QoS.** QoS 1 publishing needs `esp-mqtt` or an equivalent client; `PubSubClient` only publishes
   QoS 0 [26].
-- **R10 Local dev quirk.** The Edge Function must reach the DeepSeek stub from inside Docker. For local tests, set
-  `DEEPSEEK_BASE_URL=http://host.docker.internal:<port>`.
+- **R10 Local dev quirk.** The Edge Function must reach the Anthropic API stub from inside Docker. For local tests, set
+  `ANTHROPIC_BASE_URL=http://host.docker.internal:<port>`.
