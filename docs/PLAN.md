@@ -7,8 +7,8 @@ Scope of this repo:
 - everything that lives in Supabase: schema, migrations, RLS, cron jobs, the derived plant status, the `chat` Edge
   Function, and the generated TypeScript types.
 
-Firmware and dashboard have their own plans. §4 records the final cross-repo contract as the user decided it on
-2026-11-16. Where this plan differed from that contract, the contract wins.
+Firmware and dashboard have their own plans. §4 records the final cross-repo contract, fixed on 2026-11-16.
+Where this plan differed from that contract, the contract wins.
 
 Research date: 2026-11-16. Numbers in brackets like [3] point to the sources list in §2.11.
 
@@ -89,7 +89,7 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   denied [15].
 - The Debian main config already enables persistence and includes `conf.d`. Repeating settings such as
   `persistence_location` there stops the broker from starting [15].
-- Without TLS, credentials travel in clear text [15]. The user accepts this on the home LAN.
+- Without TLS, credentials travel in clear text [15]. This is accepted on the home LAN.
 - The common Arduino `PubSubClient` can only publish QoS 0 [26]. The contract requires QoS 1, so firmware needs
   `esp-mqtt` or an equivalent client.
 
@@ -890,7 +890,7 @@ the static prefix and before the history.
 
 ---
 
-## 6. Task breakdown (each task owns disjoint files; parallel workers)
+## 6. Task breakdown
 
 The interfaces in §5.3, the schema in §5.6 and the contract in §4 are fixed by this plan. Every task adds its own
 tests. Depending on what it touches, it must pass `uv run pytest`, `supabase test db` and/or `deno test`.
@@ -898,7 +898,7 @@ tests. Depending on what it touches, it must pass `uv run pytest`, `supabase tes
 | ID | Owner files | Depends on | Acceptance criteria | Verify (no hardware) |
 |---|---|---|---|---|
 | **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `migrations/20261116000150_profile_spathiphyllum.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | — | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Profile migration:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources) as an idempotent upsert; pgTAP asserts that it exists after migrations alone (`supabase db reset --no-seed`) and that re-applying the SQL leaves one row. **Seed (local/test only):** a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; `timezone` updates to `Asia/Seol`, `UTC+3` or `''` fail with 22023 and leave the row unchanged, while `Asia/Seoul` succeeds; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
-| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C in the review example), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. **Soil clamping:** with dry=3000, wet=1000 and raw {0, 3000}, `soil_pct_avg` = 50 %, which equals the mean of `readings_v.soil_pct` for the bucket; after a recalibration the two still agree. **Retention + late arrival:** a daily bucket built from temperatures {10, 30} (mean 20) is sealed by `apply_retention()`, which deletes the 10; a late reading of 30 is then inserted into that sealed day. The stored daily mean stays 20, the row is counted in `late_rows_ignored`, and the next retention run deletes it. `rebuild_rollups` skips sealed buckets without raising. `sealed_before` is hour-aligned, never moves backwards, and is correct for a +05:30 timezone. **Timezone change after a seal:** with a seal at `2026-08-18 00:00Z` in UTC, switching the plant to `Asia/Seoul` succeeds without error. It keeps sealed UTC day 2026-08-17 unchanged, rebuilds daily rows only from KST 2026-08-19 on, writes no 2026-08-18 row, and causes no primary-key collision. A switch from +14:00 to -12:00 also succeeds. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
+| **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. **Soil clamping:** with dry=3000, wet=1000 and raw {0, 3000}, `soil_pct_avg` = 50 %, which equals the mean of `readings_v.soil_pct` for the bucket; after a recalibration the two still agree. **Retention + late arrival:** a daily bucket built from temperatures {10, 30} (mean 20) is sealed by `apply_retention()`, which deletes the 10; a late reading of 30 is then inserted into that sealed day. The stored daily mean stays 20, the row is counted in `late_rows_ignored`, and the next retention run deletes it. `rebuild_rollups` skips sealed buckets without raising. `sealed_before` is hour-aligned, never moves backwards, and is correct for a +05:30 timezone. **Timezone change after a seal:** with a seal at `2026-08-18 00:00Z` in UTC, switching the plant to `Asia/Seoul` succeeds without error. It keeps sealed UTC day 2026-08-17 unchanged, rebuilds daily rows only from KST 2026-08-19 on, writes no 2026-08-18 row, and causes no primary-key collision. A switch from +14:00 to -12:00 also succeeds. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
 | **T3 Status view + offline periods** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status, labels and summary for every rule in §5.6, including `no_data`, `offline` (> 180 s), uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules. `device_offline_periods` returns: gaps > 180 s only; gaps clipped at the window edges; a gap spanning midnight in both days' results; `device_restart` when `boot_id` changes; `ongoing` for an open trailing gap; nothing for another owner's device (RLS); an error for a window > 7 days | Table-driven pgTAP with fixed `now()` via fixtures |
 | **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. **Overlapping requests:** with fixtures where messages A then B are both admitted before either is answered, A's prompt ends with A as the final user turn, B's prompt excludes A (unanswered) and ends with B, every prompt alternates user/assistant, and each reply's `reply_to` points at its own question (`deno test` with the stub capturing request bodies). `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body has `thinking.type="disabled"` and `model="deepseek-flash"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
 | **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | — | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
@@ -915,7 +915,7 @@ Only these need the real hardware:
 
 ---
 
-## 7. Things the user must do by hand
+## 7. Manual setup steps
 
 1. **Supabase project:**
    - Create a Free project and keep "Automatically expose new tables" **off**.
@@ -967,7 +967,7 @@ Only these need the real hardware:
 
 ## 8. Risks and open questions
 
-**Open questions:** none block v1. The user's 2026-11-16 decisions answered all earlier questions (login, language,
+**Open questions:** none block v1. The 2026-11-16 contract settled all earlier questions (login, language,
 retention, DeepSeek use, MQTT encryption, backups).
 
 **Risks:**
