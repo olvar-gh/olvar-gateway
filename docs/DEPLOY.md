@@ -106,7 +106,8 @@ First see what will be applied, without changing anything:
 supabase db push --remote --dry-run
 ```
 
-You should see five files, from `20261116000100_core.sql` to `20261116000400_chat.sql`. Now apply them:
+You should see every file in `supabase/migrations`, from `20261116000100_core.sql` to
+`20261120000100_spathiphyllum_no_em_dashes.sql`. Now apply them:
 
 ```sh
 supabase db push --remote
@@ -118,7 +119,7 @@ Answer `y`. Then check that every migration shows in the **Remote** column:
 supabase migration list --remote
 ```
 
-`db push` never runs `supabase/seed.sql`, so no test users or fake readings reach your project. The peace lily
+`db push` never runs `supabase/seed.sql`, so no test users or fake readings reach your project. The Spathiphyllum
 profile is created by a migration, so it is there now.
 
 ### A6. Give the chat function its Anthropic key, then deploy it
@@ -156,7 +157,8 @@ Answer `y`. The list shows `chat` as `ACTIVE`. Leave JWT verification on: only t
    This is the login you will use in the Olvar app.
 3. Dashboard → **Authentication → Sign In / Providers**: turn **Allow new users to sign up** **off** and save.
 
-The plant and the device are created in step B8, once you know the ESP32's device id.
+The plant and the device are created, and the gateway is given to this account, in step B8, once you know the
+ESP32's device id.
 
 ---
 
@@ -271,7 +273,7 @@ It must end with `config ok`. Otherwise it lists what to fix.
 Connect the ESP32 to your computer with USB and open its serial monitor (see the firmware README). The boot log
 shows the `device_id` (the serial command `status` prints it too), for example `olvar-a1b2c3`. Write it down; this guide calls it `<device-id>`.
 
-### B8. Create the plant and the device in Supabase
+### B8. Create the plant and the device, and claim the gateway, in Supabase
 
 On the Pi, in `~/olvar-gateway`. Use the owner email from A7, the device id from B7, and your time zone as an IANA
 name such as `Europe/Berlin`, `America/New_York` or `Asia/Seoul` (run `timedatectl` to see the Pi's):
@@ -285,11 +287,19 @@ sudo /opt/olvar-gateway/venv/bin/python tools/setup_plant.py \
   --timezone <Area/City>
 ```
 
+It also makes you the owner of this gateway: it reads `GATEWAY_ID` from the env file (`olvar-gw` unless you
+changed it) and sets the owner of that row in `gateways`. Without this the dashboard shows the gateway as "not
+seen yet" even though it is running, because only the owner may read the row. The output ends its summary with
+`gateway: olvar-gw (owned by <owner-email>)`. The gateway's own heartbeat never touches the owner.
+
 Optional: `--nickname Lily` and `--location "Living room window"`. You can run it again safely; it keeps the
-same plant. Possible errors:
+same plant, the device's calibration and the gateway's heartbeat values. Possible errors:
 
 - *migrations are missing* or *profile 'spathiphyllum' is missing*: do step A5 again.
 - *no user with email …*: do step A7 (check the spelling).
+- *gateway olvar-gw already belongs to another user*: this `GATEWAY_ID` is used by another account in the
+  project. Give this Pi its own `GATEWAY_ID` in `/etc/olvar-gateway/gateway.env`, restart the gateway and run the
+  command again.
 - *unknown timezone*: use a name from the list at https://en.wikipedia.org/wiki/List_of_tz_database_time_zones.
 
 ### B9. MQTT user for the ESP32
@@ -338,7 +348,8 @@ sudo -u olvar /opt/olvar-gateway/venv/bin/python -m olvar_gateway status
 ```
 
 `queue_depth` stays near 0 and `last_error` is `none`. In the Supabase dashboard, **Table Editor → readings**
-shows new rows, and **devices** shows your device as `online`.
+shows new rows, **devices** shows your device as `online`, and **gateways** shows `olvar-gw` with your user id in
+`owner_id` and a `last_seen_at` from the last five minutes.
 
 Last step: calibrate the soil probe in the app's **Soil calibration** screen (dry value when the plant needs water,
 wet value after a full watering has drained).
@@ -360,3 +371,7 @@ config files) and restarts the gateway. Your `gateway.env` and MQTT passwords ar
 If a release adds database migrations or changes the chat function, repeat on your computer, inside the same
 checkout (`git checkout <tag>` first): `supabase db push --remote --dry-run`, `supabase db push --remote`, and
 `supabase functions deploy chat --use-api`.
+
+If the dashboard shows the gateway as "not seen yet" although `journalctl -u olvar-gateway` shows no
+`heartbeat failed`, the gateway has no owner (installs set up before `setup_plant.py` claimed it). Run step B8
+again with the same values; it changes nothing else.

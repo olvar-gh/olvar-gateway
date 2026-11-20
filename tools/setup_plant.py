@@ -3,8 +3,9 @@
     python tools/setup_plant.py --env-file /etc/olvar-gateway/gateway.env \\
         --owner-email you@example.com --device-id olvar-a1b2c3 --timezone Europe/Berlin
 
-Reads SUPABASE_URL and SUPABASE_SECRET_KEY from --env-file or the environment. Safe to run again: it
-reuses the owner's existing plant and only updates what the flags set.
+Reads SUPABASE_URL, SUPABASE_SECRET_KEY and GATEWAY_ID from --env-file or the environment. Safe to
+run again: it reuses the owner's existing plant, only updates what the flags set, and claims the
+gateway (public.gateways) for the owner, so the dashboard can see its heartbeat.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import httpx
 PROFILE_ID = "spathiphyllum"
 DEVICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,31}$")
 RESERVED_IDS = {"olvar-gateway"}
+DEFAULT_GATEWAY_ID = "olvar-gw"  # same default as olvar_gateway.config
 PASSWD_FILE = "/etc/mosquitto/passwd"
 MIGRATIONS_HINT = "apply the migrations first: supabase db push --remote (see docs/DEPLOY.md)"
 
@@ -172,6 +174,23 @@ def ensure_device(api: Api, device_id: str, owner_id: str, plant_id: str) -> Non
     )
 
 
+def ensure_gateway(api: Api, gateway_id: str, owner_id: str) -> None:
+    existing = api.rest(
+        "GET", "gateways", params={"select": "id,owner_id", "id": f"eq.{gateway_id}"}
+    )
+    if existing and existing[0].get("owner_id") not in (None, owner_id):
+        raise SetupError(f"gateway {gateway_id} already belongs to another user")
+    # Only id and owner_id: version, buffer_depth and last_seen_at stay the heartbeat's. The
+    # heartbeat never sends owner_id, so it cannot change or clear this.
+    api.rest(
+        "POST",
+        "gateways",
+        params={"on_conflict": "id"},
+        json={"id": gateway_id, "owner_id": owner_id},
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
+
+
 def run(args: argparse.Namespace, env: Mapping[str, str], client: httpx.Client) -> str:
     device_id = args.device_id.strip()
     if not DEVICE_ID_RE.fullmatch(device_id) or device_id in RESERVED_IDS:
@@ -185,17 +204,20 @@ def run(args: argparse.Namespace, env: Mapping[str, str], client: httpx.Client) 
         raise SetupError("SUPABASE_URL and SUPABASE_SECRET_KEY are required (--env-file or env)")
     if not key.startswith("sb_secret_"):
         raise SetupError("SUPABASE_SECRET_KEY must be the secret key 'gateway' (sb_secret_...)")
+    gateway_id = env.get("GATEWAY_ID", "").strip() or DEFAULT_GATEWAY_ID
 
     api = Api(url, key, client)
     require_profile(api)
     owner_id = find_owner_id(api, args.owner_email)
     plant_id, created = ensure_plant(api, owner_id, args.timezone, args.nickname, args.location)
     ensure_device(api, device_id, owner_id, plant_id)
+    ensure_gateway(api, gateway_id, owner_id)
     return "\n".join(
         [
             f"owner:  {args.owner_email} ({owner_id})",
             f"plant:  {plant_id} ({'created' if created else 'updated'}, timezone {args.timezone})",
             f"device: {device_id} (linked)",
+            f"gateway: {gateway_id} (owned by {args.owner_email})",
             "",
             "Next, on the Pi, give the ESP32 its MQTT password (no -c: the file already exists):",
             f"  sudo mosquitto_passwd {PASSWD_FILE} {device_id}",

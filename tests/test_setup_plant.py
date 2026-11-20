@@ -28,6 +28,7 @@ class FakeSupabase:
         ]
         self.plants: list[dict] = []
         self.devices: dict[str, dict] = {}
+        self.gateways: dict[str, dict] = {}
         self.writes: list[tuple[str, str, dict]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -48,6 +49,8 @@ class FakeSupabase:
             return self.plants_endpoint(request.method, q, body)
         if table == "devices":
             return self.devices_endpoint(request.method, q, body)
+        if table == "gateways":
+            return self.gateways_endpoint(request.method, q, body)
         raise AssertionError(path)
 
     def plants_endpoint(self, method: str, q: dict, body: dict | None) -> httpx.Response:
@@ -82,6 +85,14 @@ class FakeSupabase:
         self.devices.setdefault(body["id"], {}).update(body)
         return httpx.Response(201)
 
+    def gateways_endpoint(self, method: str, q: dict, body: dict | None) -> httpx.Response:
+        if method == "GET":
+            gateway = self.gateways.get(q["id"].removeprefix("eq."))
+            return httpx.Response(200, json=[gateway] if gateway else [])
+        assert q["on_conflict"] == "id"
+        self.gateways.setdefault(body["id"], {}).update(body)
+        return httpx.Response(201)
+
 
 def args(**overrides) -> argparse.Namespace:
     values = {
@@ -96,9 +107,9 @@ def args(**overrides) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
-def run(fake: FakeSupabase, **overrides) -> str:
+def run(fake: FakeSupabase, env: dict | None = None, **overrides) -> str:
     client = httpx.Client(transport=httpx.MockTransport(fake.handler))
-    return setup_plant.run(args(**overrides), ENV, client)
+    return setup_plant.run(args(**overrides), ENV if env is None else env, client)
 
 
 def test_creates_plant_and_device_and_prints_passwd_command_without_c():
@@ -139,6 +150,43 @@ def test_device_created_by_gateway_before_setup_gets_linked():
     run(fake)
     assert fake.devices["olvar-a1b2c3"]["owner_id"] == OWNER
     assert fake.devices["olvar-a1b2c3"]["fw"] == "0.1.0"
+
+
+def test_claims_default_gateway_for_owner():
+    fake = FakeSupabase()
+    out = run(fake)
+    assert fake.gateways == {"olvar-gw": {"id": "olvar-gw", "owner_id": OWNER}}
+    assert "gateway: olvar-gw" in out
+
+
+def test_claims_gateway_id_from_env_and_keeps_heartbeat_columns():
+    fake = FakeSupabase()
+    fake.gateways["pi-kitchen"] = {
+        "id": "pi-kitchen",
+        "owner_id": None,
+        "version": "0.2.0",
+        "buffer_depth": 0,
+        "last_seen_at": "2026-11-20T08:00:00+00:00",
+    }
+    run(fake, env={**ENV, "GATEWAY_ID": "pi-kitchen"})
+    run(fake, env={**ENV, "GATEWAY_ID": "pi-kitchen"})
+    assert fake.gateways["pi-kitchen"] == {
+        "id": "pi-kitchen",
+        "owner_id": OWNER,
+        "version": "0.2.0",
+        "buffer_depth": 0,
+        "last_seen_at": "2026-11-20T08:00:00+00:00",
+    }
+    gateway_writes = [body for _, table, body in fake.writes if table == "gateways"]
+    assert gateway_writes == [{"id": "pi-kitchen", "owner_id": OWNER}] * 2
+
+
+def test_gateway_of_another_owner_is_refused():
+    fake = FakeSupabase()
+    fake.gateways["olvar-gw"] = {"id": "olvar-gw", "owner_id": OTHER}
+    with pytest.raises(setup_plant.SetupError, match="gateway olvar-gw already belongs"):
+        run(fake)
+    assert fake.gateways["olvar-gw"]["owner_id"] == OTHER
 
 
 def test_missing_migrations_says_db_push():

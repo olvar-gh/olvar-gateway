@@ -37,7 +37,7 @@ RECONNECT_MAX_S: Final = 60
 INTAKE_ATTEMPTS: Final = 3
 INTAKE_RETRY_S: Final = 0.2
 
-# (topic, payload, retained) — retained is True for a retained message replayed on subscribe.
+# (topic, payload, retained): retained is True for a retained message replayed on subscribe.
 MessageHandler = Callable[[str, bytes, bool], None]
 
 

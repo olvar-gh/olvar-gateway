@@ -1,6 +1,6 @@
 import { anchoredHistory, buildContextBlock, type ChatRow, fallbackReply, type PlantContext } from "./context.ts";
 import { AnthropicError, type AnthropicConfig, completeWithRetry } from "./anthropic.ts";
-import { buildPrompt } from "./prompt.ts";
+import { buildPrompt, stripEmDashes } from "./prompt.ts";
 
 export const MAX_MESSAGE_CHARS = 1000;
 
@@ -122,7 +122,7 @@ export function createHandler(deps: Deps): (req: Request) => Promise<Response> {
     let reply: NewReply;
     try {
       const c = await completeWithRetry(deps.anthropic, prompt, startedAt);
-      reply = { ...base, content: c.content, model: c.model, tokens_in: c.tokensIn, tokens_out: c.tokensOut, error: null };
+      reply = { ...base, content: stripEmDashes(c.content), model: c.model, tokens_in: c.tokensIn, tokens_out: c.tokensOut, error: null };
     } catch (e) {
       const error = e instanceof AnthropicError ? e.message : `unexpected: ${(e as Error).message}`;
       log({ event: "anthropic_failed", plant_id: plantId, message_id: admitted.id, error });

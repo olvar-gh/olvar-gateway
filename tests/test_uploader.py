@@ -278,6 +278,8 @@ def test_device_upsert_never_sends_calibration(server, writer):
 
 
 def test_heartbeat(server, writer):
+    # No owner_id: with merge-duplicates the heartbeat updates only the columns it sends, so the
+    # owner claimed by tools/setup_plant.py is never changed or cleared.
     assert writer.heartbeat("olvar-gw", "0.1.0", 12).ok
     [req] = server.requests
     assert req.url.path == "/rest/v1/gateways"

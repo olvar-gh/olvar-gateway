@@ -131,7 +131,7 @@ function ctx(overrides: Partial<PlantContext> = {}): PlantContext {
     nickname: "Lily",
     location: "Living room",
     timezone: "Asia/Seoul",
-    commonName: "Peace lily",
+    commonName: "Spathiphyllum",
     scientificName: "Spathiphyllum wallisii",
     careNotes: "Keep moist, not soggy.",
     thresholds: { soil_pct: { low: 35 } },
@@ -153,7 +153,7 @@ function ctx(overrides: Partial<PlantContext> = {}): PlantContext {
 Deno.test("context block: local time, status, measurements, summaries, thresholds, care notes", () => {
   const block = buildContextBlock(ctx());
   assertStringIncludes(block, "LOCAL TIME: Monday 2026-11-16 14:05 (Asia/Seoul)");
-  assertStringIncludes(block, "PLANT: Lily, Peace lily (Spathiphyllum wallisii), location: Living room");
+  assertStringIncludes(block, "PLANT: Lily, Spathiphyllum (Spathiphyllum wallisii), location: Living room");
   assertStringIncludes(block, "STATUS: Needs attention (needs_attention). Soil is getting dry, water soon");
   assertStringIncludes(block, "soil: Getting dry (low)");
   assertStringIncludes(block, "1 min ago");
