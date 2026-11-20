@@ -1,14 +1,6 @@
--- Display texts (owner request, 2026-11-20):
---   * the species is shown as "Spathiphyllum", not "Peace lily" (plant_profiles.common_name and care_notes);
---   * no em dashes (U+2014) in any user-visible text: plant_status_v.summary is redefined with colons, and plant
---     replies already stored in chat_messages get theirs replaced.
--- Applied migrations are never edited; this one supersedes the texts of 20261116000150 and 20261116000300.
-
-update public.plant_profiles
-set common_name = 'Spathiphyllum',
-    care_notes = pg_catalog.replace(care_notes, 'Peace lily (Spathiphyllum), a tropical understory plant. ',
-                                    'Spathiphyllum (common name peace lily), a tropical understory plant. ')
-where id = 'spathiphyllum';
+-- No em dashes (U+2014) in any user-visible text (owner request, 2026-11-20): plant_status_v.summary is redefined
+-- with colons, and plant replies already stored in chat_messages get theirs replaced.
+-- Applied migrations are never edited; this one supersedes the summary texts of 20261116000300.
 
 -- Same rule as the chat function's stripEmDashes(): a spaced dash becomes a comma, a bare one a hyphen. Neither
 -- makes the text longer, so the 2000-character check still holds. User messages are the owner's own words.

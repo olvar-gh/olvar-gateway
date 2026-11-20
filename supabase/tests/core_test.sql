@@ -2,7 +2,7 @@
 -- depend on seed.sql (except that the profile must exist after migrations alone).
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(84);
+select plan(82);
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Fixtures (as postgres): owner A with a plant, an uncalibrated device, a gateway and readings; user B with nothing.
@@ -56,11 +56,6 @@ select is((select cardinality(sources) from public.plant_profiles where id = 'sp
           'profile cites sources [45]-[57]');
 select ok(exists (select 1 from supabase_migrations.schema_migrations where version = '20261116000150'),
           'profile migration is recorded');
-select is((select common_name from public.plant_profiles where id = 'spathiphyllum'), 'Spathiphyllum',
-          'the species is shown as Spathiphyllum after all migrations (20261120000100)');
-select ok((select care_notes like 'Spathiphyllum (common name peace lily), %' and strpos(care_notes, U&'\2014') = 0
-           from public.plant_profiles where id = 'spathiphyllum'),
-          'care notes call the plant Spathiphyllum and contain no em dash');
 update public.plant_profiles set common_name = 'changed' where id = 'spathiphyllum';
 select lives_ok($$
   do $do$

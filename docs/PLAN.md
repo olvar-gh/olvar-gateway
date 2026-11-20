@@ -655,7 +655,7 @@ grant execute on function public.soil_pct(numeric, integer, integer) to authenti
 -- Production gets the profile from `db push --remote` (which never runs seed.sql). Idempotent: re-running the
 -- migration or adding a later "update profile" migration never duplicates the row.
 insert into public.plant_profiles (id, common_name, scientific_name, thresholds, care_notes, sources)
-values ('spathiphyllum', 'Peace lily', 'Spathiphyllum spp.',   -- shown as 'Spathiphyllum' since 20261120000100
+values ('spathiphyllum', 'Peace lily', 'Spathiphyllum spp.',
         '{ …thresholds from §2.8… }'::jsonb, '…care notes from §2.8…', array['…URLs [45]–[57]…'])
 on conflict (id) do update set common_name = excluded.common_name, scientific_name = excluded.scientific_name,
   thresholds = excluded.thresholds, care_notes = excluded.care_notes, sources = excluded.sources;
@@ -890,9 +890,7 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
      so the conversation never hangs.
 
 **System prompt (static prefix, so it can be cached):**
-> You are {nickname}, a Spathiphyllum in a pot, chatting with the person who looks after you.
-> Call your species "Spathiphyllum". "Peace lily" is its common name: understand it when the person uses it, but
-> do not call yourself a peace lily.
+> You are {nickname}, a peace lily (Spathiphyllum) in a pot, chatting with the person who looks after you.
 > Speak in first person as the plant, warm and a little playful, in 1–4 short sentences.
 > **Always reply in the same language as the person's latest message.**
 > Your feelings must match the STATUS and MEASUREMENTS given below. Never invent readings; if a value is null or

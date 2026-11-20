@@ -31,7 +31,7 @@ class MemoryStore implements Store {
       nickname: "Lily",
       location: null,
       timezone: this.timezone,
-      commonName: "Spathiphyllum",
+      commonName: "Peace lily",
       scientificName: "Spathiphyllum wallisii",
       careNotes: "Keep moist.",
       thresholds: {},
@@ -159,7 +159,7 @@ Deno.test("success: stores both rows and returns the plant reply", async () => {
     const body = s.bodies[0] as { model: string; thinking: { type: string }; system: string; messages: ChatTurn[] };
     assertEquals(body.model, "claude-sonnet-5-5");
     assertEquals(body.thinking, { type: "adaptive" });
-    assertStringIncludes(body.system, "You are Lily, a Spathiphyllum in a pot");
+    assertStringIncludes(body.system, "You are Lily, a peace lily");
     assertStringIncludes(body.system, "Never use em dashes");
     assert(!body.system.includes("\u2014"), "the prompt itself contains no em dash");
     assertStringIncludes(body.system, "same language as the person's latest message");

@@ -107,7 +107,7 @@ supabase db push --remote --dry-run
 ```
 
 You should see every file in `supabase/migrations`, from `20261116000100_core.sql` to
-`20261120000100_spathiphyllum_no_em_dashes.sql`. Now apply them:
+`20261120000100_no_em_dashes.sql`. Now apply them:
 
 ```sh
 supabase db push --remote
@@ -119,7 +119,7 @@ Answer `y`. Then check that every migration shows in the **Remote** column:
 supabase migration list --remote
 ```
 
-`db push` never runs `supabase/seed.sql`, so no test users or fake readings reach your project. The Spathiphyllum
+`db push` never runs `supabase/seed.sql`, so no test users or fake readings reach your project. The peace lily
 profile is created by a migration, so it is there now.
 
 ### A6. Give the chat function its Anthropic key, then deploy it
