@@ -15,7 +15,7 @@ export interface AnthropicConfig {
   model: string;
   /** Deadline for one API call, including reading the body. */
   timeoutMs: number;
-  /** Deadline for all calls of one chat message together, including a Retry-After wait. */
+  /** Deadline for all calls of one chat message together, including a Retry-After wait, counted from `startedAt`. */
   budgetMs?: number;
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
@@ -51,8 +51,9 @@ export const EFFORT = "medium";
 // Thinking counts toward max_tokens, so this leaves room for the reasoning plus a reply of 1 to 4 short sentences.
 export const MAX_TOKENS = 4000;
 export const DEFAULT_TIMEOUT_MS = 45_000;
-// Stays well under the 150 s Edge Function wall clock, leaving time for the database work around the call.
-export const DEFAULT_BUDGET_MS = 100_000;
+// Counted from when the request arrives. Leaves about 5 s to store the reply or fallback, so the function answers
+// within about 55 s, before the dashboard offers Retry for an unanswered question at 60 s.
+export const DEFAULT_BUDGET_MS = 50_000;
 // A retry is only worth sending if it has at least this long (or the whole per-call timeout, if shorter) to finish.
 const MIN_RETRY_MS = 10_000;
 
@@ -98,6 +99,8 @@ export async function chatCompletion(cfg: AnthropicConfig, prompt: Prompt, timeo
         output_config: { effort: EFFORT },
       }),
       signal,
+      // A redirect would carry x-api-key to the new host, so none is followed.
+      redirect: "error",
     });
   } catch (e) {
     throw new AnthropicError(signal.aborted ? "timeout" : `network: ${(e as Error).message}`, false);
@@ -146,10 +149,15 @@ export async function chatCompletion(cfg: AnthropicConfig, prompt: Prompt, timeo
 
 // One retry at most: each admitted message may cost two calls, which is what the daily cost cap assumes (§2.7).
 // Both calls and any Retry-After wait share one budget; a retry that cannot fit is not sent.
-export async function completeWithRetry(cfg: AnthropicConfig, prompt: Prompt): Promise<Completion> {
+export async function completeWithRetry(
+  cfg: AnthropicConfig,
+  prompt: Prompt,
+  startedAt = (cfg.now ?? Date.now)(),
+): Promise<Completion> {
   const now = cfg.now ?? Date.now;
   const sleep = cfg.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  const deadline = now() + (cfg.budgetMs ?? DEFAULT_BUDGET_MS);
+  const deadline = startedAt + (cfg.budgetMs ?? DEFAULT_BUDGET_MS);
+  if (deadline - now() <= 0) throw new AnthropicError("timeout", false);
   try {
     return await chatCompletion(cfg, prompt, Math.min(cfg.timeoutMs, deadline - now()));
   } catch (e) {

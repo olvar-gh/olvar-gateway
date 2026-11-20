@@ -96,17 +96,17 @@ sudo deploy/install.sh
 ## Change the Anthropic key
 
 Create a new key on https://console.anthropic.com (**Settings → API keys → Create key**). Then, on your computer,
-in the linked checkout:
+in a checkout linked to the project:
 
 ```sh
 printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; echo
 supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
 unset ANTHROPIC_API_KEY
-supabase functions deploy chat --use-api
 supabase secrets list
 ```
 
-Answer `y` to each confirmation. The chat function reads the new key on its next request. Check a real reply
+Answer `y` to the confirmation. Do not redeploy: Supabase gives the running function the new secret without a
+deploy, and a deploy would publish whatever code this checkout has. Check a real reply from the running function
 (see "Check that chat answers with Claude" below), then disable the old key in the Console.
 
 ## Check that chat answers with Claude

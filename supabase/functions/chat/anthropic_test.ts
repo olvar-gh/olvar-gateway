@@ -15,7 +15,9 @@ function stubFetch(replies: Reply[]) {
   const bodies: Record<string, unknown>[] = [];
   const urls: string[] = [];
   const headers: Headers[] = [];
+  const inits: RequestInit[] = [];
   const f: typeof fetch = async (input, init) => {
+    inits.push(init ?? {});
     urls.push(String(input));
     headers.push(new Headers(init?.headers));
     bodies.push(JSON.parse(String(init?.body)));
@@ -23,7 +25,7 @@ function stubFetch(replies: Reply[]) {
     if (!next) throw new Error("unexpected extra call");
     return await next();
   };
-  return { f, bodies, urls, headers };
+  return { f, bodies, urls, headers, inits };
 }
 
 const message = (content: { type: string; text?: string; thinking?: string }[], stopReason = "end_turn") => () =>
@@ -61,7 +63,7 @@ function cfg(f: typeof fetch, extra: Partial<AnthropicConfig> = {}): AnthropicCo
     apiKey: "test-key",
     model: "claude-sonnet-5-5",
     timeoutMs: 1000,
-    budgetMs: 60_000,
+    budgetMs: 50_000,
     fetch: f,
     ...extra,
   };
@@ -77,6 +79,7 @@ Deno.test("request: Messages API url, headers and body with the system prompt at
   assertEquals(s.headers[0].get("x-api-key"), "test-key");
   assertEquals(s.headers[0].get("anthropic-version"), "2026-10-21");
   assertEquals(s.headers[0].get("authorization"), null);
+  assertEquals(s.inits[0].redirect, "error");
   assertEquals(s.bodies[0], {
     model: "claude-sonnet-5-5",
     max_tokens: 4000,
@@ -107,7 +110,7 @@ Deno.test("env config: defaults and overrides", () => {
   const d = anthropicConfigFromEnv(env({ ANTHROPIC_API_KEY: "k" }));
   assertEquals(
     [d.baseUrl, d.apiKey, d.model, d.timeoutMs, d.budgetMs],
-    ["https://api.anthropic.com", "k", "claude-sonnet-5-5", 45_000, 100_000],
+    ["https://api.anthropic.com", "k", "claude-sonnet-5-5", 45_000, 50_000],
   );
   const o = anthropicConfigFromEnv(env({
     ANTHROPIC_BASE_URL: "http://127.0.0.1:9/",
@@ -228,8 +231,8 @@ Deno.test("retry-after: a delay that does not fit the budget returns the error w
 
 Deno.test("retry-after: a delay that leaves too little time for the retry call is not waited for", async () => {
   const c = clock();
-  // 60 s budget, 1 s per-call timeout: a 59.5 s wait leaves 0.5 s, less than one call needs.
-  const s = stubFetch([status(529, { "retry-after": "59.5" })]);
+  // 50 s budget, 1 s per-call timeout: a 49.5 s wait leaves 0.5 s, less than one call needs.
+  const s = stubFetch([status(529, { "retry-after": "49.5" })]);
   await assertRejects(() => completeWithRetry(cfg(s.f, c), PROMPT), AnthropicError, "http 529");
   assertEquals([c.sleeps, s.bodies.length], [[], 1]);
 });
@@ -266,4 +269,68 @@ Deno.test("parseRetryAfter: seconds, HTTP dates and junk", () => {
   assertEquals(parseRetryAfter("Thu, 19 Nov 2026 23:00:00 GMT", now), 0);
   assertEquals(parseRetryAfter(null, now), null);
   assertEquals(parseRetryAfter("soon", now), null);
+});
+
+Deno.test("redirect: a redirecting endpoint never sees the key forwarded and the call is not retried", async () => {
+  const seen: (string | null)[] = [];
+  const ac = new AbortController();
+  const elsewhere = Deno.serve({ port: 0, hostname: "127.0.0.1", signal: ac.signal, onListen: () => {} }, (req) => {
+    seen.push(req.headers.get("x-api-key"));
+    return ok("leaked")();
+  });
+  let calls = 0;
+  const api = Deno.serve({ port: 0, hostname: "127.0.0.1", signal: ac.signal, onListen: () => {} }, () => {
+    calls++;
+    return new Response(null, {
+      status: 307,
+      headers: { location: `http://127.0.0.1:${elsewhere.addr.port}/v1/messages` },
+    });
+  });
+  try {
+    const e = await assertRejects(
+      () => completeWithRetry({ ...cfg(fetch), baseUrl: `http://127.0.0.1:${api.addr.port}` }, PROMPT),
+      AnthropicError,
+    );
+    assert(e.message.startsWith("network:"), e.message);
+    assertEquals([e.retryable, calls, seen], [false, 1, []]);
+  } finally {
+    ac.abort();
+    await Promise.all([api.finished, elsewhere.finished]);
+  }
+});
+
+Deno.test("budget: counted from startedAt, so time spent before the call shortens it", async () => {
+  const c = clock();
+  const timeouts: number[] = [];
+  const realTimeout = AbortSignal.timeout;
+  AbortSignal.timeout = (ms: number) => {
+    timeouts.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  };
+  try {
+    const s = stubFetch([ok("hi")]);
+    // 50 s budget, 20 s already spent on the database before the call: the call gets 30 s, not 45 s.
+    await completeWithRetry(cfg(s.f, { ...c, timeoutMs: 45_000 }), PROMPT, c.now() - 20_000);
+    assertEquals(timeouts, [30_000]);
+    // A budget already used up returns a timeout without calling the API.
+    const none = stubFetch([]);
+    await assertRejects(
+      () => completeWithRetry(cfg(none.f, c), PROMPT, c.now() - 50_000),
+      AnthropicError,
+      "timeout",
+    );
+    assertEquals(none.bodies.length, 0);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+  }
+});
+
+Deno.test("budget: with the defaults, a 429 Retry-After that would end past 50 s is not waited for", async () => {
+  const c = clock();
+  const s = stubFetch([status(429, { "retry-after": "45" })]);
+  const e = await assertRejects(
+    () => completeWithRetry({ ...cfg(s.f, c), timeoutMs: 45_000, budgetMs: undefined }, PROMPT),
+    AnthropicError,
+  );
+  assertEquals([e.message, c.sleeps, s.bodies.length], ["http 429", [], 1]);
 });

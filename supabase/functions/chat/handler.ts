@@ -63,6 +63,8 @@ export function createHandler(deps: Deps): (req: Request) => Promise<Response> {
   const log = deps.log ?? ((e) => console.log(JSON.stringify(e)));
 
   return async (req) => {
+    // The Anthropic budget counts from here, so the database work before the call is included.
+    const startedAt = (deps.anthropic.now ?? Date.now)();
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (req.method !== "POST") return json(405, { error: "method_not_allowed" });
 
@@ -119,7 +121,7 @@ export function createHandler(deps: Deps): (req: Request) => Promise<Response> {
 
     let reply: NewReply;
     try {
-      const c = await completeWithRetry(deps.anthropic, prompt);
+      const c = await completeWithRetry(deps.anthropic, prompt, startedAt);
       reply = { ...base, content: c.content, model: c.model, tokens_in: c.tokensIn, tokens_out: c.tokensOut, error: null };
     } catch (e) {
       const error = e instanceof AnthropicError ? e.message : `unexpected: ${(e as Error).message}`;

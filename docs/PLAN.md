@@ -873,8 +873,9 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
      prompt plus context in the top-level `system` field, the history in `messages`, `thinking:{type:"adaptive"}` and
      `output_config:{effort:"medium"}` [40][41]. No `temperature` (rejected on this API version [42]). Only the
      `text` blocks of the answer are stored and returned; `thinking` blocks are dropped.
-   - Timeout of 45 s per call, and a budget of 100 s for all calls of one message together (the Edge Function wall
-     clock is 150 s [32]).
+   - Timeout of 45 s per call, and a budget of 50 s for all calls of one message together, counted from when the
+     request arrives and including any `Retry-After` wait. With about 5 s to store the reply, the function answers
+     within about 55 s, before the dashboard offers Retry at 60 s; when the budget runs out, the fallback is stored.
    - One retry on 429, 5xx (including 529), an empty reply or an unparseable body. If the response has a
      `Retry-After` header, the retry waits that long first, but only if the wait plus 10 s for the call still fits
      the budget; otherwise the fallback is stored after one call. A 4xx, a timeout or a `refusal` stop reason is not
@@ -957,8 +958,10 @@ Only these need the real hardware:
 4. **Anthropic:**
    - Create an account at console.anthropic.com and add credit (prepaid).
    - Create an API key.
-   - Run `supabase secrets set ANTHROPIC_API_KEY=…` and confirm; it targets the linked project [34][60]. If an old
-     `DEEPSEEK_API_KEY` secret exists, remove it with `supabase secrets unset DEEPSEEK_API_KEY`.
+   - Run `supabase secrets set ANTHROPIC_API_KEY=…` and confirm; it targets the linked project [34][60].
+   - An existing deployment that ran the DeepSeek chat keeps `DEEPSEEK_API_KEY` and follows the verified cutover in
+     `docs/RUNBOOK.md` ("Move the chat from DeepSeek to Claude"): set the Anthropic key, deploy, check a real Claude
+     reply, and only then unset the old key.
 5. **Raspberry Pi:**
    - Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager: hostname `olvar-gw`, user, SSH, Wi-Fi or
      Ethernet.
@@ -1000,8 +1003,9 @@ retention, LLM provider, MQTT encryption, backups).
   - Models and prices change [38], so `ANTHROPIC_MODEL` is configurable.
   - The daily cap of 200 admitted messages is enforced atomically. With Sonnet 5.5 it bounds the cost at about
     $280/month, or $560/month if every message paid for two full calls (§2.7). A Console spend limit adds a hard cap.
-  - A reply with thinking takes longer. The dashboard offers Retry for an unanswered question after 60 s; a slow
-    answer that arrives later still appears under its question through `reply_to`.
+  - A reply with thinking takes longer. The dashboard offers Retry for an unanswered question after 60 s, so the
+    function's 50 s Anthropic budget (§5.7) makes it store a reply or the fallback before then. Otherwise Retry on a
+    second device could admit the same question again while the first request is still running.
 - **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration, including summaries
   and sealed buckets, through the stored `soil_raw` distributions. If the probe is moved
   to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the
