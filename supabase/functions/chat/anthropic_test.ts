@@ -1,10 +1,11 @@
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1.0.13";
 import {
   type AnthropicConfig,
   anthropicConfigFromEnv,
   AnthropicError,
   chatCompletion,
   completeWithRetry,
+  parseRetryAfter,
   type Prompt,
 } from "./anthropic.ts";
 
@@ -25,21 +26,45 @@ function stubFetch(replies: Reply[]) {
   return { f, bodies, urls, headers };
 }
 
-const message = (content: { type: string; text?: string }[], stopReason = "end_turn") => () =>
+const message = (content: { type: string; text?: string; thinking?: string }[], stopReason = "end_turn") => () =>
   Response.json({
     id: "msg_test",
     type: "message",
     role: "assistant",
-    model: "claude-haiku-5-5",
+    model: "claude-sonnet-5-5",
     content,
     stop_reason: stopReason,
     usage: { input_tokens: 100, output_tokens: 20 },
   });
 const ok = (text: string) => message([{ type: "text", text }]);
-const status = (code: number) => () => new Response("nope", { status: code });
+const status = (code: number, headers: Record<string, string> = {}) => () =>
+  new Response("nope", { status: code, headers });
 
-function cfg(f: typeof fetch): AnthropicConfig {
-  return { baseUrl: "http://stub.test", apiKey: "test-key", model: "claude-haiku-5-5", timeoutMs: 1000, fetch: f };
+/** A fake clock: sleep() advances it instead of waiting. */
+function clock() {
+  let t = 1_000_000;
+  const sleeps: number[] = [];
+  return {
+    now: () => t,
+    sleep: (ms: number) => {
+      sleeps.push(ms);
+      t += ms;
+      return Promise.resolve();
+    },
+    sleeps,
+  };
+}
+
+function cfg(f: typeof fetch, extra: Partial<AnthropicConfig> = {}): AnthropicConfig {
+  return {
+    baseUrl: "http://stub.test",
+    apiKey: "test-key",
+    model: "claude-sonnet-5-5",
+    timeoutMs: 1000,
+    budgetMs: 60_000,
+    fetch: f,
+    ...extra,
+  };
 }
 
 const PROMPT: Prompt = { system: "You are a plant.", messages: [{ role: "user", content: "hi" }] };
@@ -47,31 +72,60 @@ const PROMPT: Prompt = { system: "You are a plant.", messages: [{ role: "user", 
 Deno.test("request: Messages API url, headers and body with the system prompt at the top level", async () => {
   const s = stubFetch([ok("hello")]);
   const c = await chatCompletion(cfg(s.f), PROMPT);
-  assertEquals(c, { content: "hello", model: "claude-haiku-5-5", tokensIn: 100, tokensOut: 20 });
+  assertEquals(c, { content: "hello", model: "claude-sonnet-5-5", tokensIn: 100, tokensOut: 20 });
   assertEquals(s.urls, ["http://stub.test/v1/messages"]);
   assertEquals(s.headers[0].get("x-api-key"), "test-key");
   assertEquals(s.headers[0].get("anthropic-version"), "2026-10-21");
   assertEquals(s.headers[0].get("authorization"), null);
   assertEquals(s.bodies[0], {
-    model: "claude-haiku-5-5",
-    max_tokens: 400,
+    model: "claude-sonnet-5-5",
+    max_tokens: 4000,
     system: "You are a plant.",
     messages: PROMPT.messages,
-    thinking: { type: "disabled" },
-    output_config: { effort: "low" },
+    thinking: { type: "adaptive" },
+    output_config: { effort: "medium" },
   });
 });
+
+// Sonnet 5.5 rejects thinking "disabled"; "between_tools" is Sonnet 5.5 only; Haiku 5.5 accepts adaptive at any
+// effort. Adaptive + medium is the one setting valid for both, so the body must not depend on the model.
+for (const model of ["claude-sonnet-5-5", "claude-haiku-5-5"]) {
+  Deno.test(`request: ${model} gets adaptive thinking at medium effort and room for thinking plus the reply`, async () => {
+    const s = stubFetch([ok("hello")]);
+    await chatCompletion(cfg(s.f, { model }), PROMPT);
+    const body = s.bodies[0] as Record<string, unknown>;
+    assertEquals(body.model, model);
+    assertEquals(body.thinking, { type: "adaptive" });
+    assertEquals(body.output_config, { effort: "medium" });
+    assert((body.max_tokens as number) >= 2000, "max_tokens leaves room for thinking");
+    for (const k of ["temperature", "top_p", "top_k"]) assert(!(k in body), `${k} is not sent`);
+  });
+}
 
 Deno.test("env config: defaults and overrides", () => {
   const env = (m: Record<string, string>) => ({ get: (k: string) => m[k] });
   const d = anthropicConfigFromEnv(env({ ANTHROPIC_API_KEY: "k" }));
-  assertEquals([d.baseUrl, d.apiKey, d.model, d.timeoutMs], ["https://api.anthropic.com", "k", "claude-haiku-5-5", 25_000]);
-  const o = anthropicConfigFromEnv(env({ ANTHROPIC_BASE_URL: "http://127.0.0.1:9/", ANTHROPIC_MODEL: "claude-sonnet-5-5" }));
-  assertEquals([o.baseUrl, o.model], ["http://127.0.0.1:9", "claude-sonnet-5-5"]);
+  assertEquals(
+    [d.baseUrl, d.apiKey, d.model, d.timeoutMs, d.budgetMs],
+    ["https://api.anthropic.com", "k", "claude-sonnet-5-5", 45_000, 100_000],
+  );
+  const o = anthropicConfigFromEnv(env({
+    ANTHROPIC_BASE_URL: "http://127.0.0.1:9/",
+    ANTHROPIC_MODEL: "claude-haiku-5-5",
+    ANTHROPIC_TIMEOUT_MS: "30000",
+    ANTHROPIC_BUDGET_MS: "70000",
+  }));
+  assertEquals([o.baseUrl, o.model, o.timeoutMs, o.budgetMs], ["http://127.0.0.1:9", "claude-haiku-5-5", 30_000, 70_000]);
 });
 
-Deno.test("response: text blocks are joined and other block types are ignored", async () => {
-  const s = stubFetch([message([{ type: "thinking" }, { type: "text", text: "Hi " }, { type: "text", text: "there" }])]);
+Deno.test("response: only text blocks reach the user, thinking blocks are dropped", async () => {
+  const s = stubFetch([
+    message([
+      { type: "thinking", thinking: "The soil reading is low, so..." },
+      { type: "text", text: "Hi " },
+      { type: "text", text: "there" },
+    ]),
+  ]);
   assertEquals((await chatCompletion(cfg(s.f), PROMPT)).content, "Hi there");
 });
 
@@ -156,4 +210,60 @@ Deno.test("retry: a malformed body is still retried as invalid json", async () =
   const s = stubFetch([() => new Response("{not json", { status: 200 }), ok("fine")]);
   assertEquals((await completeWithRetry(cfg(s.f), PROMPT)).content, "fine");
   assertEquals(s.bodies.length, 2);
+});
+
+Deno.test("retry-after: a 429 waits the requested delay before the one retry", async () => {
+  const c = clock();
+  const s = stubFetch([status(429, { "retry-after": "3" }), ok("after waiting")]);
+  assertEquals((await completeWithRetry(cfg(s.f, c), PROMPT)).content, "after waiting");
+  assertEquals([c.sleeps, s.bodies.length], [[3000], 2]);
+});
+
+Deno.test("retry-after: a delay that does not fit the budget returns the error without a second call", async () => {
+  const c = clock();
+  const s = stubFetch([status(429, { "retry-after": "120" })]);
+  const e = await assertRejects(() => completeWithRetry(cfg(s.f, c), PROMPT), AnthropicError);
+  assertEquals([e.message, e.retryAfterMs, c.sleeps, s.bodies.length], ["http 429", 120_000, [], 1]);
+});
+
+Deno.test("retry-after: a delay that leaves too little time for the retry call is not waited for", async () => {
+  const c = clock();
+  // 60 s budget, 1 s per-call timeout: a 59.5 s wait leaves 0.5 s, less than one call needs.
+  const s = stubFetch([status(529, { "retry-after": "59.5" })]);
+  await assertRejects(() => completeWithRetry(cfg(s.f, c), PROMPT), AnthropicError, "http 529");
+  assertEquals([c.sleeps, s.bodies.length], [[], 1]);
+});
+
+Deno.test("budget: the retry's timeout is cut to what is left of the budget", async () => {
+  let t = 0;
+  const timeouts: number[] = [];
+  const realTimeout = AbortSignal.timeout;
+  AbortSignal.timeout = (ms: number) => {
+    timeouts.push(ms);
+    return realTimeout.call(AbortSignal, ms);
+  };
+  const f: typeof fetch = () => {
+    t += 40_000; // each call takes 40 s of the fake clock
+    return Promise.resolve(new Response("busy", { status: 503 }));
+  };
+  try {
+    const e = await assertRejects(
+      () => completeWithRetry(cfg(f, { now: () => t, timeoutMs: 45_000, budgetMs: 70_000 }), PROMPT),
+      AnthropicError,
+    );
+    // 70 s budget and the first call used 40 s: the 30 s left is enough for a retry, and the retry gets only that.
+    assertEquals([e.message, timeouts], ["http 503", [45_000, 30_000]]);
+  } finally {
+    AbortSignal.timeout = realTimeout;
+  }
+});
+
+Deno.test("parseRetryAfter: seconds, HTTP dates and junk", () => {
+  const now = Date.parse("2026-11-20T00:00:00Z");
+  assertEquals(parseRetryAfter("7", now), 7000);
+  assertEquals(parseRetryAfter("0", now), 0);
+  assertEquals(parseRetryAfter("Fri, 20 Nov 2026 00:00:05 GMT", now), 5000);
+  assertEquals(parseRetryAfter("Thu, 19 Nov 2026 23:00:00 GMT", now), 0);
+  assertEquals(parseRetryAfter(null, now), null);
+  assertEquals(parseRetryAfter("soon", now), null);
 });

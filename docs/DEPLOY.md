@@ -12,7 +12,7 @@ Daily operations (logs, updates, passwords, replacing a device) are in [RUNBOOK.
 ## What you need
 
 - A Supabase account and an organization to create the project in.
-- An Anthropic Console account with some prepaid credit (console.anthropic.com). The chat uses Claude Haiku 5.5.
+- An Anthropic Console account with some prepaid credit (console.anthropic.com). The chat uses Claude Sonnet 5.5.
 - A Raspberry Pi 3B, a good microSD card (16 GB or more, A1/A2 class), the official 5 V 2.5 A power supply.
 - The ESP32 plant sensor, flashed with the Olvar firmware, and a USB cable to read its serial log.
 - On your computer: `git`, and a terminal.
@@ -135,11 +135,10 @@ supabase secrets list
 ```
 
 Answer `y` to the confirmation. `secrets list` shows `ANTHROPIC_API_KEY` with a hash, never the key itself.
-If the list still shows `DEEPSEEK_API_KEY` from an earlier setup, remove it: the function no longer reads it.
 
-```sh
-supabase secrets unset DEEPSEEK_API_KEY
-```
+If the list also shows `DEEPSEEK_API_KEY`, this project ran the older DeepSeek chat. **Leave that secret in place
+for now:** the running function still uses it until the deploy below succeeds and a real Claude reply has been
+checked. Follow "Move the chat from DeepSeek to Claude" in [RUNBOOK.md](RUNBOOK.md) instead of the rest of this step.
 
 Deploy the function (`--use-api` bundles it on Supabase's servers, so Docker is not needed):
 

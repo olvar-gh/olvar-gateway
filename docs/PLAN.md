@@ -42,11 +42,11 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - The Supabase Edge Function **`chat`** is called by the signed-in owner.
   - It stores the user's message through an **atomic quota check** (`chat_admit`), so concurrent requests cannot
     exceed the limits.
-  - It gives Claude Haiku 5.5 **`claude-haiku-5-5`** (Anthropic Messages API, thinking off) a context of plant profile, thresholds, `plant_status_v`,
+  - It gives Claude Sonnet 5.5 **`claude-sonnet-5-5`** (Anthropic Messages API, adaptive thinking at medium effort) a context of plant profile, thresholds, `plant_status_v`,
     the latest reading, 24 h and 7 d summaries, and the last 10 completed question/answer pairs before this message.
   - It stores the reply and returns it. The plant answers in first person, in the language of the user's message.
   - The Anthropic API key (`ANTHROPIC_API_KEY`) exists only in Edge Function secrets.
-  - Cost is about **$0.0006 per message**.
+  - Cost is about **$0.02 per message** (§2.7).
 - **Data volume and retention:** 1,440 readings a day is about 0.3 MB/day. Raw readings are kept for **90 days**.
   **Hourly and daily summaries** are built by pg_cron, which resumes from a persisted watermark and keeps
   per-metric sample counts.
@@ -146,14 +146,21 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - `supabase functions serve --env-file` runs Edge Functions locally.
 
 ### 2.5 Anthropic Messages API (verified 2026-11-20; replaced DeepSeek)
-- **The model id is exactly `claude-haiku-5-5`** (Claude Haiku 5.5, the current Haiku) [38][39].
+- **The default model id is exactly `claude-sonnet-5-5`** (Claude Sonnet 5.5, the current Sonnet) [38][39].
+  `ANTHROPIC_MODEL` can switch to `claude-haiku-5-5` (Claude Haiku 5.5) with the same request body.
 - Requests are `POST https://api.anthropic.com/v1/messages` with the headers `x-api-key` and `anthropic-version`
   (`2026-10-21`) [40][43].
 - The system prompt goes in the top-level `system` field; `messages` holds only `user` and `assistant` turns, starting
   with `user` [40][43].
-- **Claude Haiku 5.5 prices per 1M tokens** (prompts up to 100K tokens): input $0.10, output $0.50 [39].
-- **Thinking is on by default.** `{"thinking": {"type": "disabled"}}` is accepted at effort `high` or below; `chat`
-  sends it with `output_config.effort` `low` [41].
+- **Prices per 1M tokens:** Claude Sonnet 5.5 input $2, output $10; Claude Haiku 5.5 input $0.10, output $0.50
+  (prompts up to 100K tokens) [39].
+- **Thinking (verified 2026-11-20 against [41] and [44]):**
+  - Claude Sonnet 5.5 rejects `{"thinking": {"type": "disabled"}}` with HTTP 400. Its lowest setting,
+    `{"type": "between_tools"}`, is rejected by every other model.
+  - Both models accept adaptive thinking (`{"type": "adaptive"}`) with `output_config.effort`. `chat` sends
+    adaptive at `medium`, so one body is valid for either model.
+  - Thinking tokens count toward `max_tokens`, so `chat` sends 4,000: room for the reasoning plus a short reply.
+  - Thinking comes back as `thinking` blocks (with empty text by default); `chat` keeps only the `text` blocks.
 - On API version `2026-10-21`, `temperature`, `top_p` and `top_k` are rejected with HTTP 400, so `chat` sends none of
   them [42].
 - A reply ends with `stop_reason`; `refusal` means a safety decline, which is not retried [43].
@@ -174,13 +181,17 @@ Research date: 2026-11-16. Numbers in brackets like [3] point to the sources lis
   - plant context of about 1,200 tokens;
   - history of the last 10 completed question/answer pairs, about 1,600 tokens;
   - the user's message;
-  - total about **3,600 input tokens**, plus at most **400 output tokens**.
-- **Worst case with no cache hits:**
-  3,600 × $0.10/M + 400 × $0.50/M ≈ **$0.0006 per message**.
-- **Monthly estimates:**
-  - At 30 messages a day, about **$0.5/month** at worst.
-  - At the hard cap of 200 admitted messages a day, at most about **$3.4/month**. If every message also used its one
-    retry (400 calls a day), at most about **$6.7/month**.
+  - total about **3,600 input tokens**, plus thinking and reply: typically about **1,000 output tokens** at medium
+    effort, at most **4,000** (`max_tokens`).
+- **Claude Sonnet 5.5, no cache hits:**
+  - typical: 3,600 × $2/M + 1,000 × $10/M ≈ **$0.017 per message**;
+  - worst case: 3,600 × $2/M + 4,000 × $10/M ≈ **$0.047 per message**.
+- **Monthly estimates (Sonnet 5.5):**
+  - At 30 messages a day, about **$15/month** typical, **$43/month** at worst.
+  - At the hard cap of 200 admitted messages a day, at most about **$280/month**. A retry adds a second call, but most
+    retried calls (429, 5xx) are not billed; if every message paid for two full calls, at most about **$560/month**.
+  - Set a monthly spend limit in the Anthropic Console to bound this.
+- **Claude Haiku 5.5** through `ANTHROPIC_MODEL` costs about 20 times less: at most about $0.0024 per message.
 
 ### 2.8 Peace lily (Spathiphyllum) care thresholds
 Sources are university extension services. 1 fc = 10.764 lux.
@@ -278,7 +289,7 @@ Sources are university extension services. 1 fc = 10.764 lux.
 | D6 | **Gateway stamps `recorded_at`, but only from an NTP-synced clock** (§5.4) | The ESP32 has no clock and the Pi has no RTC [6][7] | Always trusting the Pi clock |
 | D7 | **`soil_pct` is computed in the database at read time** by `public.soil_pct(raw, dry, wet)` and exposed through `security_invoker` views. Only `soil_raw` is stored | One formula in one place. Recalibration takes effect immediately, including history and rollups, without rewriting rows. Before calibration the value is null | **Gateway computes on insert**: the gateway would need the calibration, and recalibrating would leave stale values or need a mass UPDATE that floods Realtime. **Trigger plus stored column**: same recalibration problem. **Per-calibration history applied by `recorded_at`**: more correct if the probe moves, but out of v1 scope (see R6) |
 | D8 | **Status pill = SQL view `plant_status_v`** (deterministic, no LLM) | Every client and the chat function read the same values. Testable with pgTAP | Client-side rules (clients could disagree); LLM-generated mood (contract A forbids it) |
-| D9 | **Chat = Edge Function `chat`**, non-streaming, Claude Haiku 5.5 (`claude-haiku-5-5`) through the Anthropic Messages API with thinking disabled, plain text output | The key stays server-side. A reply of ≤ 400 tokens arrives in a few seconds | Streaming (possible later); calling the Anthropic API from the client (would expose the key); structured JSON output (not needed). DeepSeek `deepseek-flash` was used until 2026-11-20 |
+| D9 | **Chat = Edge Function `chat`**, non-streaming, Claude Sonnet 5.5 (`claude-sonnet-5-5`) through the Anthropic Messages API with adaptive thinking at medium effort, plain text output | The key stays server-side. Thinking plus a short reply (≤ 4,000 tokens) usually arrives within about 10 to 30 s | Streaming (possible later); calling the Anthropic API from the client (would expose the key); structured JSON output (not needed). DeepSeek `deepseek-flash` was used until 2026-11-20 |
 | D10 | **Language follows the user's message** (instruction in the system prompt) | Contract A; no locale setting needed | A per-plant locale column |
 | D11 | **Plain tables + pg_cron rollups** | timescaledb is deprecated on PG17 [35] | Hypertables; materialized views |
 | D12 | **Realtime INSERT on `readings` acts as a signal; clients re-read from `readings_v`** | Realtime streams tables, not views [27], and `soil_pct` exists only in the views. This costs one small query per minute | Storing `soil_pct` (rejected in D7); client-side `soil_pct` math (two places) |
@@ -401,7 +412,7 @@ ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
      pg_cron: :05 hourly → refresh_rollups (watermark) · 03:30 UTC → apply_retention (catch up, seal, delete raw > 90 d)
      fns:    device_offline_periods() (Timeline) · chat_admit() (atomic quota)
                          ▲                                   ▲
-   Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ Anthropic claude-haiku-5-5
+   Expo dashboard (publishable key + owner login) ──POST──▶ Edge Fn `chat` ──▶ Anthropic claude-sonnet-5-5
           └── Realtime: readings INSERT (signal), devices UPDATE, chat_messages INSERT
 ```
 
@@ -858,13 +869,19 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
      - The dashboard orders replies under their question with `reply_to`.
 5. **Call Claude:**
    - `POST https://api.anthropic.com/v1/messages` with headers `x-api-key: $ANTHROPIC_API_KEY` and
-     `anthropic-version: 2026-10-21`, and a body of `model:"claude-haiku-5-5"`, `max_tokens:400`, the system prompt
-     plus context in the top-level `system` field, the history in `messages`, `thinking:{type:"disabled"}` and
-     `output_config:{effort:"low"}` [40][41]. No `temperature` (rejected on this API version [42]).
-   - Timeout of 25 s; one retry on 429, 5xx (including 529), an empty reply or an unparseable body. A 4xx, a
-     timeout or a `refusal` stop reason is not retried.
-   - `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL` and `ANTHROPIC_TIMEOUT_MS` can be overridden through env (the base URL
-     is used for the test stub).
+     `anthropic-version: 2026-10-21`, and a body of `model:"claude-sonnet-5-5"`, `max_tokens:4000`, the system
+     prompt plus context in the top-level `system` field, the history in `messages`, `thinking:{type:"adaptive"}` and
+     `output_config:{effort:"medium"}` [40][41]. No `temperature` (rejected on this API version [42]). Only the
+     `text` blocks of the answer are stored and returned; `thinking` blocks are dropped.
+   - Timeout of 45 s per call, and a budget of 100 s for all calls of one message together (the Edge Function wall
+     clock is 150 s [32]).
+   - One retry on 429, 5xx (including 529), an empty reply or an unparseable body. If the response has a
+     `Retry-After` header, the retry waits that long first, but only if the wait plus 10 s for the call still fits
+     the budget; otherwise the fallback is stored after one call. A 4xx, a timeout or a `refusal` stop reason is not
+     retried.
+   - `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_TIMEOUT_MS` and `ANTHROPIC_BUDGET_MS` can be overridden
+     through env (the base URL is used for the test stub). The request body is valid for `claude-sonnet-5-5` and
+     `claude-haiku-5-5`.
 6. **Store the reply** with `role='plant'`, `reply_to = m.id`, `based_on_reading_at` (the `recorded_at` of the latest reading in the
    context), the model name and the token usage, then return it.
    - If the Anthropic API call fails, store and return a short deterministic fallback built from `plant_status_v`, with `error` set,
@@ -896,7 +913,7 @@ tests. Depending on what it touches, it must pass `uv run pytest`, `supabase tes
 | **T1 Core schema** | `supabase/config.toml`, `migrations/20261116000100_core.sql`, `migrations/20261116000150_profile_spathiphyllum.sql`, `supabase/seed.sql`, `supabase/tests/core_test.sql` | n/a | **Schema:** tables, `soil_pct()`, `readings_v`, grants, RLS and publication exactly as in §5.6. **Profile migration:** the spathiphyllum profile (thresholds and care notes from §2.8, plus sources) as an idempotent upsert; pgTAP asserts that it exists after migrations alone (`supabase db reset --no-seed`) and that re-applying the SQL leaves one row. **Seed (local/test only):** a local owner, a plant (tz `Asia/Seoul` for local only, overridable), device `olvar-a1b2c3` with calibration, and 48 h of synthetic readings. **pgTAP:** the owner sees rows and a second user sees none; anon gets nothing; the owner can update only the calibration columns, plus `nickname`, `location`, `timezone` and `threshold_overrides` on plants; malformed overrides are rejected; `timezone` updates to `Asia/Seol`, `UTC+3` or `''` fail with 22023 and leave the row unchanged, while `Asia/Seoul` succeeds; reversed or too-close calibration is rejected; the dedup key works; `soil_pct` is null when uncalibrated, clamps to 0–100, and follows a recalibration retroactively | `supabase start && supabase db reset && supabase test db` |
 | **T2 Rollups & retention** | `migrations/20261116000200_rollups.sql`, `supabase/tests/rollups_test.sql` | T1 DDL | `refresh_rollups` is idempotent. A late row updates its old bucket. **Catch-up:** with `processed_until` set 3 days back, one run fills every missed bucket. Concurrent runs: the second exits on the advisory lock. **Null sensors:** a fixture with one valid temperature in hour A and 60 in hour B gives the exact daily mean (≈29.84 °C), and per-metric `_n` is correct. Daily values use the local date, including a +05:30 timezone. The views compute inverted soil min/max. **Soil clamping:** with dry=3000, wet=1000 and raw {0, 3000}, `soil_pct_avg` = 50 %, which equals the mean of `readings_v.soil_pct` for the bucket; after a recalibration the two still agree. **Retention + late arrival:** a daily bucket built from temperatures {10, 30} (mean 20) is sealed by `apply_retention()`, which deletes the 10; a late reading of 30 is then inserted into that sealed day. The stored daily mean stays 20, the row is counted in `late_rows_ignored`, and the next retention run deletes it. `rebuild_rollups` skips sealed buckets without raising. `sealed_before` is hour-aligned, never moves backwards, and is correct for a +05:30 timezone. **Timezone change after a seal:** with a seal at `2026-08-18 00:00Z` in UTC, switching the plant to `Asia/Seoul` succeeds without error. It keeps sealed UTC day 2026-08-17 unchanged, rebuilds daily rows only from KST 2026-08-19 on, writes no 2026-08-18 row, and causes no primary-key collision. A switch from +14:00 to -12:00 also succeeds. Cron jobs are registered | pgTAP fixtures; `select * from cron.job` |
 | **T3 Status view + offline periods** | `migrations/20261116000300_status.sql`, `supabase/tests/status_test.sql` | T1 DDL | `effective_thresholds` merges overrides per metric. `plant_status_v` gives the right status, labels and summary for every rule in §5.6, including `no_data`, `offline` (> 180 s), uncalibrated soil, day/night light in the plant timezone, and the 12 h and 48 h "high" persistence rules. `device_offline_periods` returns: gaps > 180 s only; gaps clipped at the window edges; a gap spanning midnight in both days' results; `device_restart` when `boot_id` changes; `ongoing` for an open trailing gap; nothing for another owner's device (RLS); an error for a window > 7 days | Table-driven pgTAP with fixed `now()` via fixtures |
-| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. **Overlapping requests:** with fixtures where messages A then B are both admitted before either is answered, A's prompt ends with A as the final user turn, B's prompt excludes A (unanswered) and ends with B, every prompt alternates user/assistant, and each reply's `reply_to` points at its own question (`deno test` with the stub capturing request bodies). `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body goes to `/v1/messages` with `x-api-key`, `anthropic-version`, the top-level `system`, `thinking.type="disabled"` and `model="claude-haiku-5-5"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
+| **T4 Chat function** | `supabase/functions/chat/**`, `migrations/20261116000400_chat.sql`, `supabase/tests/chat_test.sql` | T1, T3 (reads views) | Ownership is enforced and a non-owner gets 404. Rate limits return 429. **pgTAP concurrency test:** two sessions call `chat_admit` at 199/200 and exactly one succeeds (row lock), and the same holds for the 5-min window. **Overlapping requests:** with fixtures where messages A then B are both admitted before either is answered, A's prompt ends with A as the final user turn, B's prompt excludes A (unanswered) and ends with B, every prompt alternates user/assistant, and each reply's `reply_to` points at its own question (`deno test` with the stub capturing request bodies). `based_on_reading_at` is set on plant rows. The context builder is a pure function (unit-tested). The request body goes to `/v1/messages` with `x-api-key`, `anthropic-version`, the top-level `system`, `thinking.type="adaptive"`, `output_config.effort="medium"` and `model="claude-sonnet-5-5"`. The stub covers success, empty reply, 429, 5xx and timeout → fallback row with `error`. Both rows are stored, and RLS hides chats from other users | `deno test supabase/functions/chat`; `supabase functions serve --env-file supabase/functions/.env.local` + `curl` with a seeded user's JWT |
 | **T5 Payload contract & models** | `contracts/**`, `src/olvar_gateway/models.py`, `tests/test_models.py` | n/a | The JSON Schema matches §4 (no `soil_pct`, optional `rssi_dbm`, unknown keys allowed). The pydantic model agrees on all examples. Rejects a topic/id mismatch, NaN, > 1 KiB and a bad `boot_id`. Out-of-range values become null | `uv run pytest tests/test_models.py` |
 | **T6 Clock, outbox, uploader** | `src/olvar_gateway/{clock,buffer,uploader}.py`, `tests/test_{clock,buffer,uploader}.py` | §5.3 | The outbox survives a kill. A duplicate put is a no-op. The cap drops the oldest rows. Unsynced rows are held and then backfilled. Rows with `recorded_at` older than 89 days are dead-lettered as `beyond_retention`. The uploader handles 2xx, 5xx and network errors. **Classification:** a 401/403/`42501`/404/`PGRST*` response leaves every row queued with `last_error` set, and delivery resumes once the mock is fixed; a batch with one `23514` row dead-letters only that row (bisection). It sends the headers and `on_conflict` exactly as in §5.4. Device upserts never send calibration columns | pytest with a fake clock and `httpx.MockTransport`; optional `-m supabase` against the local stack |
 | **T7 MQTT + service wiring** | `src/olvar_gateway/{mqtt_client,service,config,log,__main__}.py`, `pyproject.toml`, `uv.lock`, `requirements.txt`, `tests/test_service.py` | T5, T6 interfaces | Env config with clear errors. MQTT 5 persistent session. Status updates reach devices. Heartbeat every 5 min. SIGTERM flushes. Logs are JSON lines. `python -m olvar_gateway status` prints the queue depth, dead-letter count and `last_error` | pytest with fakes; `python -m olvar_gateway --check-config` |
@@ -978,10 +995,13 @@ retention, LLM provider, MQTT encryption, backups).
 - **R4 Supabase platform changes.** Legacy API keys are being removed [8], and new tables no longer get default
   grants [11]. The plan uses only the new keys and explicit grants.
 - **R5 LLM provider (Anthropic).**
-  - Thinking is on by default on Claude Haiku 5.5 and is disabled per request [41].
+  - Claude Sonnet 5.5 cannot run with thinking disabled [44]; `chat` uses adaptive thinking at medium effort, which
+    is also valid for Claude Haiku 5.5 [41].
   - Models and prices change [38], so `ANTHROPIC_MODEL` is configurable.
-  - The daily cap of 200 admitted messages is enforced atomically. It bounds the cost at about $3.4/month, or
-    $6.7/month if every call is retried.
+  - The daily cap of 200 admitted messages is enforced atomically. With Sonnet 5.5 it bounds the cost at about
+    $280/month, or $560/month if every message paid for two full calls (§2.7). A Console spend limit adds a hard cap.
+  - A reply with thinking takes longer. The dashboard offers Retry for an unanswered question after 60 s; a slow
+    answer that arrives later still appears under its question through `reply_to`.
 - **R6 Retroactive recalibration.** Soil history is re-expressed with the current calibration, including summaries
   and sealed buckets, through the stored `soil_raw` distributions. If the probe is moved
   to a different depth or pot, older `soil_pct` values change meaning. Storing a history of calibrations is the

@@ -108,7 +108,7 @@ const answer = (content: string): StubReply => () =>
   Response.json({
     type: "message",
     role: "assistant",
-    model: "claude-haiku-5-5",
+    model: "claude-sonnet-5-5",
     content: [{ type: "text", text: content }],
     stop_reason: "end_turn",
     usage: { input_tokens: 1200, output_tokens: 42 },
@@ -120,7 +120,7 @@ function setup(baseUrl: string, timeoutMs = 2000) {
   const handler = withErrorBoundary(createHandler({
     store,
     verifyUser: (jwt) => Promise.resolve(jwt.startsWith("jwt-") ? jwt.slice(4) : null),
-    anthropic: { baseUrl, apiKey: "test-key", model: "claude-haiku-5-5", timeoutMs },
+    anthropic: { baseUrl, apiKey: "test-key", model: "claude-sonnet-5-5", timeoutMs },
     now: () => new Date("2026-11-16T05:05:00Z"),
     log: (e) => logs.push(e),
   }));
@@ -154,11 +154,11 @@ Deno.test("success: stores both rows and returns the plant reply", async () => {
     assertEquals(reply.content, "I'm feeling lovely today!");
     assertEquals(reply.reply_to, q.id);
     assertEquals(reply.based_on_reading_at, READING_AT);
-    assertEquals([reply.model, reply.tokens_in, reply.tokens_out, reply.error], ["claude-haiku-5-5", 1200, 42, null]);
+    assertEquals([reply.model, reply.tokens_in, reply.tokens_out, reply.error], ["claude-sonnet-5-5", 1200, 42, null]);
 
     const body = s.bodies[0] as { model: string; thinking: { type: string }; system: string; messages: ChatTurn[] };
-    assertEquals(body.model, "claude-haiku-5-5");
-    assertEquals(body.thinking, { type: "disabled" });
+    assertEquals(body.model, "claude-sonnet-5-5");
+    assertEquals(body.thinking, { type: "adaptive" });
     assertStringIncludes(body.system, "You are Lily, a peace lily");
     assertStringIncludes(body.system, "same language as the person's latest message");
     assertStringIncludes(body.system, "LOCAL TIME:");
@@ -193,6 +193,27 @@ for (const [name, replies, error, timeoutMs] of failures) {
     });
   });
 }
+
+Deno.test("retry: a 429 with Retry-After is retried once after the delay and the answer is stored", async () => {
+  await withStub(async (s) => {
+    s.replies.push(() => new Response("slow down", { status: 429, headers: { "retry-after": "0" } }), answer("Hi again."));
+    const { post } = setup(s.url);
+    const { reply } = await (await post({ plant_id: PLANT, message: "hi" })).json();
+    assertEquals([reply.content, reply.error], ["Hi again.", null]);
+    assertEquals(s.bodies.length, 2);
+  });
+});
+
+Deno.test("retry: a 429 whose Retry-After exceeds the budget stores the fallback after one call", async () => {
+  await withStub(async (s) => {
+    s.replies.push(() => new Response("slow down", { status: 429, headers: { "retry-after": "3600" } }));
+    const { post } = setup(s.url);
+    const res = await post({ plant_id: PLANT, message: "hi" });
+    assertEquals(res.status, 200);
+    const { reply } = await res.json();
+    assertEquals([reply.error, reply.model, s.bodies.length], ["http 429", null, 1]);
+  });
+});
 
 Deno.test("retry: one empty reply then success stores the second answer", async () => {
   await withStub(async (s) => {
