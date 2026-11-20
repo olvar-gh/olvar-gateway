@@ -27,6 +27,8 @@ MAX_PAYLOAD_BYTES: Final = 1024
 DEVICE_ID_PATTERN: Final = r"^[a-z0-9][a-z0-9-]{2,31}$"
 BOOT_ID_PATTERN: Final = r"^[0-9a-f]{8}$"
 RESERVED_DEVICE_IDS: Final = frozenset({"olvar-gateway"})
+ClimateSensor = Literal["sht31", "dht11"]
+CLIMATE_SENSORS: Final[frozenset[str]] = frozenset({"sht31", "dht11"})
 TELEMETRY_TOPIC_RE: Final = re.compile(r"olvar/v1/([^/]+)/telemetry")
 
 PG_INT_MAX: Final = 2**31 - 1
@@ -68,6 +70,14 @@ def _not_null(value: Any) -> Any:
     return value
 
 
+def _climate_sensor(value: Any) -> Any:
+    # Optional and lenient: a known name (any case, surrounding spaces ignored) is kept; anything
+    # else, including null and non-strings, counts as absent and never rejects the message.
+    if isinstance(value, str) and (name := value.strip().lower()) in CLIMATE_SENSORS:
+        return name
+    return None
+
+
 class Telemetry(BaseModel):
     model_config = ConfigDict(extra="ignore", strict=True, allow_inf_nan=False)
 
@@ -80,6 +90,7 @@ class Telemetry(BaseModel):
     lux: float | None
     soil_raw: Int | None
     rssi_dbm: Annotated[Int | None, BeforeValidator(_not_null)] = None
+    climate_sensor: Annotated[ClimateSensor | None, BeforeValidator(_climate_sensor)] = None
     fw: Annotated[str, Field(min_length=1, max_length=64)]
 
     _out_of_range: tuple[str, ...] = PrivateAttr(default=())

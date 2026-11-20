@@ -62,6 +62,10 @@
       "type": "integer",
       "description": "Optional Wi-Fi signal strength. Omit the key when unknown; null is not allowed."
     },
+    "climate_sensor": {
+      "examples": ["sht31", "dht11"],
+      "description": "Optional. The temperature/humidity sensor the firmware is currently reading: \"sht31\" or \"dht11\". Omit the key when no climate sensor is detected. The gateway stores the latest value in devices.climate_sensor; a message without the key sets it to null, and any other value (other strings, null, non-strings) is treated as absent, never as a reason to reject the message."
+    },
     "fw": {
       "type": "string",
       "minLength": 1,

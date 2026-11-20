@@ -277,6 +277,15 @@ def test_device_upsert_never_sends_calibration(server, writer):
     }
 
 
+@pytest.mark.parametrize("value", ["sht31", None])
+def test_device_upsert_sends_climate_sensor_only_when_given(server, writer, value):
+    assert writer.upsert_device("olvar-a1b2c3", fw="0.1.0", climate_sensor=value).ok
+    assert writer.upsert_device("olvar-a1b2c3").ok
+    first, second = (json.loads(r.content) for r in server.requests)
+    assert first == {"id": "olvar-a1b2c3", "fw": "0.1.0", "climate_sensor": value}
+    assert second == {"id": "olvar-a1b2c3"}
+
+
 def test_heartbeat(server, writer):
     # No owner_id: with merge-duplicates the heartbeat updates only the columns it sends, so the
     # owner claimed by tools/setup_plant.py is never changed or cleared.

@@ -101,6 +101,7 @@ class Firmware:
             "uptime_ms": int((mono - self.booted_mono) * 1000),
             **sample,
             "rssi_dbm": self.rng.randint(-72, -52),
+            "climate_sensor": "sht31",
             "fw": FW,
         }
         self.sent += 1

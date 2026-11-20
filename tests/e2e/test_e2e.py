@@ -71,6 +71,7 @@ def test_happy_path_stores_every_reading_once(gateway, fake_device, rest):
     )
     assert device_state, device_row(rest, "olvar-e2e-happy")
     assert device_state["fw"] == "0.1.0-fake"
+    assert device_state["climate_sensor"] == "sht31"
     assert device_state["last_seen_at"] is not None
 
 

@@ -15,6 +15,7 @@ import random
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Final, Literal
 
 import httpx
@@ -67,6 +68,14 @@ class UploadResult:
 
 
 OK: Final = UploadResult("ok")
+
+
+class _Keep(Enum):
+    KEEP = "keep"
+
+
+# Default for nullable device columns: leave the stored value alone (None would clear it).
+KEEP: Final = _Keep.KEEP
 
 
 def is_row_error(code: str | None) -> bool:
@@ -195,12 +204,16 @@ class SupabaseWriter:
         status: str | None = None,
         fw: str | None = None,
         last_seen_at: datetime | None = None,
+        climate_sensor: str | _Keep | None = KEEP,
     ) -> UploadResult:
-        """Touch only {id, fw, last_seen_at} (+ status, status_changed_at for status messages);
-        calibration and owner columns are never sent."""
+        """Touch only {id, fw, last_seen_at, climate_sensor} (+ status, status_changed_at for
+        status messages); calibration and owner columns are never sent. climate_sensor=None
+        clears the column (telemetry without the field); KEEP leaves it as it is."""
         body: dict[str, Any] = {"id": device_id}
         if fw is not None:
             body["fw"] = fw
+        if climate_sensor is not KEEP:
+            body["climate_sensor"] = climate_sensor
         if last_seen_at is not None:
             body["last_seen_at"] = last_seen_at.isoformat()
         if status is not None:
