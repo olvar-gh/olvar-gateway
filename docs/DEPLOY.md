@@ -79,6 +79,7 @@ dashboard app, a chat message or git.
 ```sh
 git clone https://github.com/olvar-gh/olvar-gateway.git
 cd olvar-gateway
+git -c advice.detachedHead=false checkout v0.1.0     # the newest release tag; see CHANGELOG.md
 supabase login
 ```
 
@@ -106,8 +107,8 @@ First see what will be applied, without changing anything:
 supabase db push --remote --dry-run
 ```
 
-You should see every file in `supabase/migrations`, from `20261116000100_core.sql` to
-`20261120000100_no_em_dashes.sql`. Now apply them:
+You should see every file in `supabase/migrations`, from `20261116000100_core.sql` to the newest one
+(`20261120000200_device_climate_sensor.sql` in v0.1.0). Now apply them:
 
 ```sh
 supabase db push --remote
@@ -203,12 +204,16 @@ In your router's settings, give the Pi a **DHCP reservation** (a fixed IP addres
 
 ### B3. Download the gateway
 
-On the Pi:
+On the Pi, clone the repo and switch to the newest release tag (v0.1.0 is the first one), so the Pi runs exactly
+the code that matches the migrations you pushed in A5:
 
 ```sh
 sudo apt install -y git
 git clone https://github.com/olvar-gh/olvar-gateway.git ~/olvar-gateway
+git -C ~/olvar-gateway -c advice.detachedHead=false checkout v0.1.0
 ```
+
+Use the same tag as on your computer in A4.
 
 ### B4. Install
 
@@ -358,19 +363,64 @@ wet value after a full watering has drained).
 
 ## Updating later
 
-Releases are git tags such as `v0.2.0`. On the Pi:
+Releases are git tags such as `v0.1.0`; [CHANGELOG.md](../CHANGELOG.md) says what each one changes and whether it
+has database migrations.
 
-```sh
-cd ~/olvar-gateway
-sudo deploy/update.sh <tag>
-```
+**Order matters: the database first, then the Pi.** A new gateway may write a column that only a new migration
+creates. Until that migration is on the project, every device update fails (the gateway retries and backs off) and
+readings slow down. So, for every release:
 
-Without a tag it lists the newest ones. It checks out the tag, re-runs `install.sh` (pinned dependencies,
-config files) and restarts the gateway. Your `gateway.env` and MQTT passwords are kept.
+1. **On your computer**, in the checkout linked to the project (A4):
 
-If a release adds database migrations or changes the chat function, repeat on your computer, inside the same
-checkout (`git checkout <tag>` first): `supabase db push --remote --dry-run`, `supabase db push --remote`, and
-`supabase functions deploy chat --use-api`.
+   ```sh
+   cd olvar-gateway
+   git fetch --tags
+   git -c advice.detachedHead=false checkout <tag>
+   supabase db push --remote --dry-run     # lists only the migrations this release adds
+   supabase db push --remote               # answer y
+   supabase migration list --remote        # every migration shows in the Remote column
+   ```
+
+   If the release changes the chat function (the changelog says so), also run
+   `supabase functions deploy chat --use-api`.
+
+2. **On the Pi:**
+
+   ```sh
+   cd ~/olvar-gateway
+   sudo deploy/update.sh <tag>
+   ```
+
+   Without a tag it lists the newest ones. It checks out the tag, re-runs `install.sh` (pinned dependencies,
+   config files) and restarts the gateway. Your `gateway.env` and MQTT passwords are kept. The output includes a
+   line such as `olvar-gateway 0.1.0 (v0.1.0)`: the installed version and the tag.
+
+3. **Check:** `sudo -u olvar /opt/olvar-gateway/venv/bin/python -m olvar_gateway status` shows `last_error: none`,
+   and within five minutes the `gateways` row shows the new `version`.
+
+### The first tagged update (to v0.1.0)
+
+A Pi installed before v0.1.0 was cloned on the `main` branch and has never seen a tag. Move it to the tag once;
+from then on it always sits on a tag:
+
+1. On your computer, push the migrations as in step 1 above, with `<tag>` = `v0.1.0`. v0.1.0 adds
+   `20261120000200_device_climate_sensor.sql` (the `devices.climate_sensor` column); the dry run must list it.
+2. On the Pi:
+
+   ```sh
+   cd ~/olvar-gateway
+   git status --short --untracked-files=no      # must print nothing; update.sh refuses local changes
+   ls deploy/update.sh                          # missing on very old clones: run "git pull --ff-only" first
+   sudo deploy/update.sh v0.1.0
+   git describe --tags                          # v0.1.0
+   ```
+
+3. Check as in step 3 above: `gateways.version` is `0.1.0`. Once the ESP32 runs firmware that sends the sensor
+   name, `devices.climate_sensor` shows `sht31` or `dht11`; with older firmware it stays empty (null).
+
+If `update.sh` stops with *no tag named v0.1.0*, the tag is not published yet; wait for the release.
+
+### Other fixes after an update
 
 If the dashboard shows the gateway as "not seen yet" although `journalctl -u olvar-gateway` shows no
 `heartbeat failed`, the gateway has no owner (installs set up before `setup_plant.py` claimed it). Run step B8

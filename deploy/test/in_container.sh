@@ -9,14 +9,15 @@ expect_mode() { [[ $(stat -c '%a %U:%G' "$1") == "$2" ]] || fail "$1 is $(stat -
 until [[ $(systemctl is-system-running 2>/dev/null) =~ ^(running|degraded)$ ]]; do sleep 1; done
 
 useradd -m pi
-tag=v0.0.0-verify
+# Same shape as the real first release: an annotated tag named like v0.1.0, version from pyproject.toml.
+tag=v$(sed -n 's/^version = "\(.*\)"$/\1/p' /src/pyproject.toml)
 origin=/srv/origin
 mkdir -p "$origin"
 tar -C /src --exclude=.git --exclude=.venv --exclude=.kitchen --exclude='*.db' -cf - . | tar -C "$origin" -xf -
 git -C "$origin" init -q -b main
 git -C "$origin" -c user.name=v -c user.email=v@v add -A
 git -C "$origin" -c user.name=v -c user.email=v@v commit -qm verify
-git -C "$origin" tag "$tag"
+git -C "$origin" -c user.name=v -c user.email=v@v tag -a -m "olvar-gateway $tag" "$tag"
 chown -R pi:pi "$origin"
 sudo -u pi git clone -q "$origin" /home/pi/olvar-gateway
 repo=/home/pi/olvar-gateway
@@ -88,6 +89,7 @@ ok "service runs sandboxed, queues telemetry while Supabase is unreachable"
 
 "$repo/deploy/update.sh" "$tag" >/tmp/update.log 2>&1 || { cat /tmp/update.log; fail "update.sh"; }
 grep -q "checked out $tag" /tmp/update.log || fail "update.sh did not check out the tag"
+grep -q "^olvar-gateway ${tag#v} ($tag)$" /tmp/update.log || fail "update.sh did not install ${tag#v} at $tag"
 systemctl is-active -q olvar-gateway || fail "gateway not active after update.sh"
 ok "update.sh $tag"
 echo "ALL CHECKS PASSED"

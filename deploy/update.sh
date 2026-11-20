@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Moves the Pi to a released tag and re-runs install.sh (pinned dependencies, config files, restart).
-# Usage: sudo deploy/update.sh v0.2.0
+# Usage: sudo deploy/update.sh v0.1.0   (push the release's migrations first: docs/DEPLOY.md "Updating later")
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

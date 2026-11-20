@@ -328,6 +328,7 @@ most 1 KiB:
 | `temperature_c`, `humidity_pct`, `lux` | Number, or `null` when that sensor's read failed. **NaN is never sent** |
 | `soil_raw` | The averaged 12-bit ADC count (0–4095); **higher means drier**. `null` on failure |
 | `rssi_dbm` | Optional integer |
+| `climate_sensor` | Optional string, `"sht31"` or `"dht11"`: the temperature/humidity sensor the firmware is currently reading. Omitted when no climate sensor is detected (added 2026-11-20 for v0.1.0, see below) |
 | `fw` | String |
 
 Further telemetry rules:
@@ -335,6 +336,11 @@ Further telemetry rules:
 - The gateway **ignores unknown fields**.
 - The ESP32 **drops readings while the broker is unreachable**.
 - The interval is **60 s**.
+- **`climate_sensor`** (added 2026-11-20, same text in all three repos): the gateway stores the latest value in
+  the nullable column `devices.climate_sensor` (`text`, check in `sht31`, `dht11`). A message without the field sets
+  it to null; any other value is treated as absent, never as a reason to reject the message. The dashboard labels the
+  sensor row from it: `sht31` → "SHT31 + GY-302", `dht11` → "DHT11 + GY-302", null → "Climate sensor + GY-302".
+  Rollout order: gateway first (migration pushed, Pi updated), then firmware, then dashboard.
 
 **Status.** Topic `olvar/v1/<device_id>/status`, retained, QoS 1. The payload is the plain string `online`, published
 on connect, or `offline`, sent as the last will.
@@ -392,7 +398,7 @@ pinned copy.
 - Raw readings are kept 90 days, with hourly and daily summaries.
 - No off-site backups.
 - Firmware is updated over USB only.
-- The hardware is a Pi 3B, connected over Wi-Fi/MQTT, with 60 s updates. Where Figma says "Pi 4", "USB serial" or
+- The hardware is a Pi 3B, connected over Wi-Fi/MQTT, with 60 s updates. Where the original design mockups say "Pi 4", "USB serial" or
   "10 s", the app follows the real hardware.
 
 ---
@@ -419,7 +425,7 @@ ESP32 ──MQTT QoS1──▶ Mosquitto (Pi :1883, user/pass + ACL)
 ### 5.2 Repository layout
 ```
 olvar-gateway/
-├── README.md · docs/{PLAN,DEPLOY,RUNBOOK}.md
+├── README.md · CHANGELOG.md · LICENSE · docs/{PLAN,DEPLOY,RUNBOOK}.md
 ├── pyproject.toml · uv.lock · requirements.txt (uv export, hashed)
 ├── contracts/telemetry.v1.schema.json · contracts/examples/{valid-*,invalid-*}.json
 ├── src/olvar_gateway/{__main__,config,models,clock,buffer,uploader,mqtt_client,service,log}.py
@@ -427,7 +433,7 @@ olvar-gateway/
 ├── tools/fake_esp32.py · tools/setup_plant.py
 ├── dev/compose.yml                     # mosquitto for local dev, using deploy/mosquitto/*
 ├── deploy/mosquitto/{olvar.conf,acl} · deploy/systemd/olvar-gateway.service · deploy/journald/olvar.conf
-│   deploy/gateway.env.example · deploy/install.sh · deploy/update.sh
+│   deploy/gateway.env.example · deploy/install.sh · deploy/update.sh · deploy/test/verify.sh
 ├── supabase/
 │   ├── config.toml · seed.sql            # LOCAL/TEST ONLY: dev owner, plant, device, synthetic readings
 │   ├── migrations/
@@ -435,8 +441,11 @@ olvar-gateway/
 │   │   ├── 20261116000150_profile_spathiphyllum.sql  # reference data: the canonical profile (idempotent upsert)
 │   │   ├── 20261116000200_rollups.sql   # hourly/daily tables + views, refresh_rollups, cron, retention
 │   │   ├── 20261116000300_status.sql    # thresholds merge fn + plant_status_v
-│   │   └── 20261116000400_chat.sql      # chat_messages, grants, RLS, publication
-│   ├── tests/{core,rollups,status,chat}_test.sql   # pgTAP
+│   │   ├── 20261116000400_chat.sql      # chat_messages, grants, RLS, publication
+│   │   ├── 20261117000100_rollups_late_lag.sql      # correct late_rows_ignored around retention runs
+│   │   ├── 20261120000100_no_em_dashes.sql          # plant_status_v summaries without em dashes
+│   │   └── 20261120000200_device_climate_sensor.sql # devices.climate_sensor
+│   ├── tests/{core,rollups,rollups_late_lag,status,chat,climate_sensor}_test.sql   # pgTAP
 │   ├── functions/chat/{index.ts,context.ts,prompt.ts,anthropic.ts,*_test.ts}
 │   └── types/database.types.ts
 └── .github/workflows/ci.yml
@@ -485,6 +494,8 @@ class SupabaseWriter:
   - `device_id` must match both the topic segment and the id regex.
   - `boot_id` must be 8 hex characters, and `seq` and `uptime_ms` must be ≥ 0.
   - Physical ranges: temperature −40…125 °C, humidity 0…100, lux 0…120,000, soil_raw 0…4095, rssi_dbm −120…0.
+  - `climate_sensor` is lowercased and trimmed; anything but `sht31` or `dht11` becomes null. Every telemetry
+    message rewrites `devices.climate_sensor` together with `fw` and `last_seen_at`; status messages never touch it.
   - An out-of-range field becomes `null` and increments a counter.
   - Invalid messages are logged at most once per device per minute.
 - **Time:**
@@ -602,6 +613,7 @@ create table public.devices (
   soil_dry_raw integer check (soil_dry_raw between 0 and 4095),
   soil_wet_raw integer check (soil_wet_raw between 0 and 4095),
   soil_calibrated_at timestamptz,
+  climate_sensor text check (climate_sensor in ('sht31', 'dht11')),   -- added by 20261120000200; gateway-written
   created_at timestamptz not null default now(),
   constraint soil_cal_pair check ((soil_dry_raw is null) = (soil_wet_raw is null)),
   constraint soil_cal_order check (soil_dry_raw is null or soil_dry_raw > soil_wet_raw + 100)
@@ -974,13 +986,14 @@ Only these need the real hardware:
    - Run `sudo deploy/install.sh`.
    - Fill in `/etc/olvar-gateway/gateway.env`.
    - Run `sudo mosquitto_passwd /etc/mosquitto/passwd olvar-xxxxxx` and `… olvar-gateway`.
-7. **ESP32:** enter the Wi-Fi details, broker host, username and password in the firmware config, then flash over USB.
+7. **ESP32:** flash the firmware over USB, then enter the Wi-Fi details, broker host, username and password in the
+   firmware's setup portal (see the olvar-firmware README).
 8. **Soil calibration:** in the dashboard's Soil calibration screen,
    - capture the dry value when the plant needs water (top 2–3 cm of soil dry);
    - capture the wet value after a full watering has drained [56].
 9. **Sensor placement:**
    - BH1750 at leaf height, facing the window.
-   - SHT31 out of direct sun and away from the wet soil surface.
+   - SHT31 (or the DHT11 fallback) out of direct sun and away from the wet soil surface.
 
 ---
 
