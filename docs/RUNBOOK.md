@@ -93,14 +93,64 @@ cd ~/olvar-gateway
 sudo deploy/install.sh
 ```
 
-## Change the DeepSeek key
+## Change the Anthropic key
 
-On your computer, in the linked checkout:
+Create a new key on https://console.anthropic.com (**Settings → API keys → Create key**). Then, on your computer,
+in a checkout linked to the project:
 
 ```sh
-printf 'DeepSeek API key: '; read -rs DEEPSEEK_API_KEY; echo
-supabase secrets set DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
-unset DEEPSEEK_API_KEY
+printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; echo
+supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+unset ANTHROPIC_API_KEY
+supabase secrets list
 ```
 
-The chat function picks up the new value on its next request.
+Answer `y` to the confirmation. Do not redeploy: Supabase gives the running function the new secret without a
+deploy, and a deploy would publish whatever code this checkout has. Check a real reply from the running function
+(see "Check that chat answers with Claude" below), then disable the old key in the Console.
+
+## Check that chat answers with Claude
+
+The function list showing `chat` as `ACTIVE` is not enough: when the Anthropic call fails, the function still answers
+HTTP 200 with a short fallback text. To see a real reply:
+
+1. Send a chat message in the Olvar app and wait for the answer.
+2. Supabase dashboard → **SQL Editor**, run:
+
+```sql
+select id, created_at, model, error
+from public.chat_messages
+where role = 'plant'
+order by id desc
+limit 1;
+```
+
+The newest row must show `model` = `claude-sonnet-5-5` (or the model set in `ANTHROPIC_MODEL`) and an empty
+`error`. If `error` is set (for example `http 401` for a wrong key, or `timeout`), the reply was the fallback: fix
+the cause and check again. The function logs (dashboard → **Edge Functions → chat → Logs**) show an
+`anthropic_failed` event with the same error.
+
+## Move the chat from DeepSeek to Claude
+
+For a project that ran the DeepSeek chat. Keep `DEEPSEEK_API_KEY` until the very end, so the old function keeps
+working if the deploy fails. On your computer, in the linked checkout, at the release that has the Claude chat:
+
+1. Set the Anthropic key, without touching the DeepSeek one:
+
+   ```sh
+   printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; echo
+   supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+   unset ANTHROPIC_API_KEY
+   supabase secrets list
+   ```
+
+   The list now shows both `ANTHROPIC_API_KEY` and `DEEPSEEK_API_KEY`.
+2. Deploy: `supabase functions deploy chat --use-api`, then `supabase functions list` shows `chat` as `ACTIVE`.
+3. Check a real Claude reply as in "Check that chat answers with Claude" above. If it fails and cannot be fixed
+   quickly, redeploy the previous release's function; it still finds `DEEPSEEK_API_KEY`.
+4. Only once a real Claude reply is stored, remove the old secret:
+
+   ```sh
+   supabase secrets unset DEEPSEEK_API_KEY
+   supabase secrets list
+   ```

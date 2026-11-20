@@ -12,7 +12,7 @@ Daily operations (logs, updates, passwords, replacing a device) are in [RUNBOOK.
 ## What you need
 
 - A Supabase account and an organization to create the project in.
-- A DeepSeek account with some prepaid credit (platform.deepseek.com).
+- An Anthropic Console account with some prepaid credit (console.anthropic.com). The chat uses Claude Sonnet 5.5.
 - A Raspberry Pi 3B, a good microSD card (16 GB or more, A1/A2 class), the official 5 V 2.5 A power supply.
 - The ESP32 plant sensor, flashed with the Olvar firmware, and a USB cable to read its serial log.
 - On your computer: `git`, and a terminal.
@@ -26,7 +26,7 @@ Write these down somewhere safe as you go (a password manager is ideal). None of
 | Project URL `https://<project-ref>.supabase.co` | Step A2 |
 | Secret key `gateway` (`sb_secret_…`) | Step A3 |
 | Owner email and password (your dashboard login) | Step A7 |
-| DeepSeek API key (`sk-…`) | Step A6 |
+| Anthropic API key (`sk-ant-…`) | Step A6 |
 | MQTT password for `olvar-gateway` | Step B5 |
 | MQTT password for the ESP32 | Step B7 |
 
@@ -121,20 +121,24 @@ supabase migration list --remote
 `db push` never runs `supabase/seed.sql`, so no test users or fake readings reach your project. The peace lily
 profile is created by a migration, so it is there now.
 
-### A6. Give the chat function its DeepSeek key, then deploy it
+### A6. Give the chat function its Anthropic key, then deploy it
 
-1. On https://platform.deepseek.com, open **API keys → Create new API key**, name it `olvar`, copy it.
+1. On https://console.anthropic.com, open **Settings → API keys → Create key**, name it `olvar`, copy it.
 2. In the terminal, still inside `olvar-gateway`, run these lines one by one. The first one waits for you to paste
    the key; nothing is shown while you paste, which keeps it out of your shell history.
 
 ```sh
-printf 'DeepSeek API key: '; read -rs DEEPSEEK_API_KEY; echo
-supabase secrets set DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"
-unset DEEPSEEK_API_KEY
+printf 'Anthropic API key: '; read -rs ANTHROPIC_API_KEY; echo
+supabase secrets set ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+unset ANTHROPIC_API_KEY
 supabase secrets list
 ```
 
-Answer `y` to the confirmation. `secrets list` shows `DEEPSEEK_API_KEY` with a hash, never the key itself.
+Answer `y` to the confirmation. `secrets list` shows `ANTHROPIC_API_KEY` with a hash, never the key itself.
+
+If the list also shows `DEEPSEEK_API_KEY`, this project ran the older DeepSeek chat. **Leave that secret in place
+for now:** the running function still uses it until the deploy below succeeds and a real Claude reply has been
+checked. Follow "Move the chat from DeepSeek to Claude" in [RUNBOOK.md](RUNBOOK.md) instead of the rest of this step.
 
 Deploy the function (`--use-api` bundles it on Supabase's servers, so Docker is not needed):
 

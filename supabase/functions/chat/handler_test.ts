@@ -1,6 +1,6 @@
 import { assert, assertEquals, assertStringIncludes } from "jsr:@std/assert@1.0.13";
 import { anchoredHistory, type ChatRow, type PlantContext } from "./context.ts";
-import type { ChatTurn } from "./deepseek.ts";
+import type { ChatTurn } from "./anthropic.ts";
 import { AdmitError, createHandler, type NewReply, type Store, withErrorBoundary } from "./handler.ts";
 
 const OWNER = "11111111-1111-4111-8111-111111111111";
@@ -38,7 +38,7 @@ class MemoryStore implements Store {
       status: {
         overall: "great",
         overall_label: "Feeling great",
-        summary: "All good — I'm feeling great",
+        summary: "All good, I'm feeling great",
         temperature_status: "ok",
         temperature_label: "Just right",
         humidity_status: "ok",
@@ -83,9 +83,9 @@ class MemoryStore implements Store {
   }
 }
 
-type StubReply = (body: { messages: ChatTurn[] }) => Response | Promise<Response>;
+type StubReply = (body: { system: string; messages: ChatTurn[] }) => Response | Promise<Response>;
 
-/** A local HTTP server standing in for api.deepseek.com, reached through DEEPSEEK_BASE_URL. */
+/** A local HTTP server standing in for api.anthropic.com, reached through ANTHROPIC_BASE_URL. */
 async function withStub(fn: (s: { url: string; bodies: Record<string, unknown>[]; replies: StubReply[] }) => Promise<void>) {
   const bodies: Record<string, unknown>[] = [];
   const replies: StubReply[] = [];
@@ -106,9 +106,12 @@ async function withStub(fn: (s: { url: string; bodies: Record<string, unknown>[]
 
 const answer = (content: string): StubReply => () =>
   Response.json({
-    model: "deepseek-flash",
-    choices: [{ message: { role: "assistant", content } }],
-    usage: { prompt_tokens: 1200, completion_tokens: 42 },
+    type: "message",
+    role: "assistant",
+    model: "claude-sonnet-5-5",
+    content: [{ type: "text", text: content }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1200, output_tokens: 42 },
   });
 
 function setup(baseUrl: string, timeoutMs = 2000) {
@@ -117,7 +120,7 @@ function setup(baseUrl: string, timeoutMs = 2000) {
   const handler = withErrorBoundary(createHandler({
     store,
     verifyUser: (jwt) => Promise.resolve(jwt.startsWith("jwt-") ? jwt.slice(4) : null),
-    deepseek: { baseUrl, apiKey: "test-key", model: "deepseek-flash", timeoutMs },
+    anthropic: { baseUrl, apiKey: "test-key", model: "claude-sonnet-5-5", timeoutMs },
     now: () => new Date("2026-11-16T05:05:00Z"),
     log: (e) => logs.push(e),
   }));
@@ -132,9 +135,7 @@ function setup(baseUrl: string, timeoutMs = 2000) {
   return { store, handler, post, logs };
 }
 
-function assertAlternatingPrompt(messages: ChatTurn[]) {
-  assertEquals(messages.slice(0, 2).map((m) => m.role), ["system", "system"]);
-  const turns = messages.slice(2);
+function assertAlternatingPrompt(turns: ChatTurn[]) {
   turns.forEach((t, i) => assertEquals(t.role, i % 2 === 0 ? "user" : "assistant"));
   assertEquals(turns.at(-1)!.role, "user");
 }
@@ -153,15 +154,16 @@ Deno.test("success: stores both rows and returns the plant reply", async () => {
     assertEquals(reply.content, "I'm feeling lovely today!");
     assertEquals(reply.reply_to, q.id);
     assertEquals(reply.based_on_reading_at, READING_AT);
-    assertEquals([reply.model, reply.tokens_in, reply.tokens_out, reply.error], ["deepseek-flash", 1200, 42, null]);
+    assertEquals([reply.model, reply.tokens_in, reply.tokens_out, reply.error], ["claude-sonnet-5-5", 1200, 42, null]);
 
-    const body = s.bodies[0] as { model: string; thinking: { type: string }; messages: ChatTurn[] };
-    assertEquals(body.model, "deepseek-flash");
-    assertEquals(body.thinking, { type: "disabled" });
-    assertStringIncludes(body.messages[0].content, "You are Lily, a peace lily");
-    assertStringIncludes(body.messages[0].content, "same language as the person's latest message");
-    assertStringIncludes(body.messages[1].content, "LOCAL TIME:");
-    assertEquals(body.messages.at(-1), { role: "user", content: "How are you?" });
+    const body = s.bodies[0] as { model: string; thinking: { type: string }; system: string; messages: ChatTurn[] };
+    assertEquals(body.model, "claude-sonnet-5-5");
+    assertEquals(body.thinking, { type: "adaptive" });
+    assertStringIncludes(body.system, "You are Lily, a peace lily");
+    assertStringIncludes(body.system, "same language as the person's latest message");
+    assertStringIncludes(body.system, "LOCAL TIME:");
+    assert(body.messages.every((m) => m.role === "user" || m.role === "assistant"), "no system turns in messages");
+    assertEquals(body.messages, [{ role: "user", content: "How are you?" }]);
   });
 });
 
@@ -185,12 +187,33 @@ for (const [name, replies, error, timeoutMs] of failures) {
       assertEquals(reply.reply_to, store.rows[0].id);
       assertEquals(reply.based_on_reading_at, READING_AT);
       assertEquals(reply.model, null);
-      assertStringIncludes(reply.content, "All good — I'm feeling great");
+      assertStringIncludes(reply.content, "All good, I'm feeling great");
       assertEquals(s.bodies.length, replies.length);
-      assertEquals(logs[0].event, "deepseek_failed");
+      assertEquals(logs[0].event, "anthropic_failed");
     });
   });
 }
+
+Deno.test("retry: a 429 with Retry-After is retried once after the delay and the answer is stored", async () => {
+  await withStub(async (s) => {
+    s.replies.push(() => new Response("slow down", { status: 429, headers: { "retry-after": "0" } }), answer("Hi again."));
+    const { post } = setup(s.url);
+    const { reply } = await (await post({ plant_id: PLANT, message: "hi" })).json();
+    assertEquals([reply.content, reply.error], ["Hi again.", null]);
+    assertEquals(s.bodies.length, 2);
+  });
+});
+
+Deno.test("retry: a 429 whose Retry-After exceeds the budget stores the fallback after one call", async () => {
+  await withStub(async (s) => {
+    s.replies.push(() => new Response("slow down", { status: 429, headers: { "retry-after": "3600" } }));
+    const { post } = setup(s.url);
+    const res = await post({ plant_id: PLANT, message: "hi" });
+    assertEquals(res.status, 200);
+    const { reply } = await res.json();
+    assertEquals([reply.error, reply.model, s.bodies.length], ["http 429", null, 1]);
+  });
+});
 
 Deno.test("retry: one empty reply then success stores the second answer", async () => {
   await withStub(async (s) => {
@@ -216,7 +239,7 @@ Deno.test("overlapping requests: each prompt is anchored to its own admitted mes
     s.replies.push(async () => {
       aArrived();
       await aWaiting;
-      return answer("I'm great, thanks!")({ messages: [] });
+      return answer("I'm great, thanks!")({ system: "", messages: [] });
     });
     s.replies.push(answer("아직 괜찮아요!"));
 
@@ -228,8 +251,8 @@ Deno.test("overlapping requests: each prompt is anchored to its own admitted mes
     const replyB = (await resB.json()).reply;
 
     const [, promptA, promptB] = s.bodies.map((b) => (b as { messages: ChatTurn[] }).messages);
-    assertEquals(promptA.slice(2).map((m) => m.content), ["hello", "Hello there!", "How are you?"]);
-    assertEquals(promptB.slice(2).map((m) => m.content), ["hello", "Hello there!", "물 줘야 해?"]);
+    assertEquals(promptA.map((m) => m.content), ["hello", "Hello there!", "How are you?"]);
+    assertEquals(promptB.map((m) => m.content), ["hello", "Hello there!", "물 줘야 해?"]);
     assert(!promptB.some((m) => m.content === "How are you?"), "B excludes A's unanswered question");
     assertAlternatingPrompt(promptA);
     assertAlternatingPrompt(promptB);
@@ -243,11 +266,11 @@ Deno.test("overlapping requests: each prompt is anchored to its own admitted mes
     await post({ plant_id: PLANT, message: "next" });
     const promptC = (s.bodies[3] as { messages: ChatTurn[] }).messages;
     assertEquals(
-      promptC.slice(2).map((m) => m.content),
+      promptC.map((m) => m.content),
       ["hello", "Hello there!", "How are you?", "I'm great, thanks!", "물 줘야 해?", "아직 괜찮아요!", "next"],
     );
     assertAlternatingPrompt(promptC);
-    assertEquals(promptC.slice(2), anchoredHistory(store.rows, store.rows.find((r) => r.content === "next")!));
+    assertEquals(promptC, anchoredHistory(store.rows, store.rows.find((r) => r.content === "next")!));
   });
 });
 
@@ -261,7 +284,7 @@ Deno.test("ownership: a non-owner gets 404 and nothing is stored or sent", async
   });
 });
 
-Deno.test("rate limit: 429 with retry_after and no DeepSeek call", async () => {
+Deno.test("rate limit: 429 with retry_after and no Anthropic API call", async () => {
   await withStub(async (s) => {
     const { store, post } = setup(s.url);
     store.limitedFor = 37;
@@ -315,6 +338,6 @@ Deno.test("timezone: a database-valid posix/ zone still gets a reply instead of 
     assertEquals(res.status, 200);
     assertEquals((await res.json()).reply.content, "Annyeong!");
     assertEquals(store.rows.map((r) => r.role), ["user", "plant"]);
-    assertStringIncludes((s.bodies[0] as { messages: ChatTurn[] }).messages[1].content, "(Asia/Seoul)");
+    assertStringIncludes((s.bodies[0] as { system: string }).system, "(Asia/Seoul)");
   });
 });

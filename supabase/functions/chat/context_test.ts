@@ -87,7 +87,7 @@ Deno.test("history: keeps only the last 10 completed pairs and skips failed requ
 const STATUS: StatusRow = {
   overall: "needs_attention",
   overall_label: "Needs attention",
-  summary: "Soil is getting dry — water soon",
+  summary: "Soil is getting dry, water soon",
   temperature_status: "ok",
   temperature_label: "Just right",
   humidity_status: "ok",
@@ -154,7 +154,7 @@ Deno.test("context block: local time, status, measurements, summaries, threshold
   const block = buildContextBlock(ctx());
   assertStringIncludes(block, "LOCAL TIME: Monday 2026-11-16 14:05 (Asia/Seoul)");
   assertStringIncludes(block, "PLANT: Lily, Peace lily (Spathiphyllum wallisii), location: Living room");
-  assertStringIncludes(block, "STATUS: Needs attention (needs_attention). Soil is getting dry — water soon");
+  assertStringIncludes(block, "STATUS: Needs attention (needs_attention). Soil is getting dry, water soon");
   assertStringIncludes(block, "soil: Getting dry (low)");
   assertStringIncludes(block, "1 min ago");
   assertStringIncludes(block, "temperature 23.4 °C");
@@ -198,7 +198,7 @@ Deno.test("condenseHourly: four 6 h blocks with n-weighted averages and overall 
 
 Deno.test("fallbackReply: deterministic and built from the status summary", () => {
   assertEquals(fallbackReply(STATUS), fallbackReply(STATUS));
-  assertStringIncludes(fallbackReply(STATUS), "Soil is getting dry — water soon");
+  assertStringIncludes(fallbackReply(STATUS), "Soil is getting dry, water soon");
   assert(fallbackReply(null).length > 0);
 });
 

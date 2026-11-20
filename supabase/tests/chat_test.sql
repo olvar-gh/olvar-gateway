@@ -60,7 +60,7 @@ select is((select role || ':' || content from admitted), 'user:How are you?', 'c
 select is((select count(*)::int from public.chat_messages where id = (select id from admitted)), 1, 'the row is stored');
 
 insert into public.chat_messages (plant_id, role, content, reply_to, based_on_reading_at, model, tokens_in, tokens_out)
-select plant_id, 'plant', 'Great!', id, now() - interval '1 minute', 'deepseek-flash', 1200, 40 from admitted;
+select plant_id, 'plant', 'Great!', id, now() - interval '1 minute', 'claude-sonnet-5-5', 1200, 40 from admitted;
 select throws_ok($$insert into public.chat_messages (plant_id, role, content, reply_to)
                    select plant_id, 'plant', 'again', id from admitted$$,
                  '23505', null, 'a user message has at most one reply');
