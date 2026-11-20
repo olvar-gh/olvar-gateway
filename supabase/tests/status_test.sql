@@ -3,7 +3,7 @@
 begin;
 create extension if not exists pgtap with schema extensions;
 set local timezone = 'UTC';
-select plan(68);
+select plan(69);
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Fixtures (as postgres): owner A with one plant per status scenario, owner B with one plant.
@@ -140,6 +140,8 @@ grant select on fx, m, ids to authenticated, service_role;
 -- ---------------------------------------------------------------------------------------------------------------
 select ok((select 'security_invoker=true' = any (reloptions) from pg_class where oid = 'public.plant_status_v'::regclass),
           'plant_status_v is security_invoker');
+select ok(strpos(pg_get_viewdef('public.plant_status_v'::regclass), U&'\2014') = 0,
+          'plant_status_v texts contain no em dash (20261120000100)');
 select ok(not has_table_privilege('anon', 'public.plant_status_v', 'select'), 'anon cannot select plant_status_v');
 select ok(not has_function_privilege('anon', 'public.device_offline_periods(text, timestamptz, timestamptz)', 'execute'),
           'anon cannot execute device_offline_periods');
@@ -201,20 +203,20 @@ order by e.name;
 -- Labels and summary: overall_label | temperature | humidity | light | soil labels | summary
 create temp table expected_text (name text, expected text);
 insert into expected_text values
-  ('great',     'Feeling great|Just right|Just right|Just right|Just right|All good — I''m feeling great'),
+  ('great',     'Feeling great|Just right|Just right|Just right|Just right|All good: I''m feeling great'),
   ('okay',      'Doing okay|Just right|Just right|Just right|Just right|Everything is within range'),
-  ('uncal',     'Feeling great|Just right|Just right|Just right|Not calibrated|All good — calibrate the soil sensor to track watering'),
-  ('soil-low',  'Needs attention|Just right|Just right|Just right|Getting dry|Soil is getting dry — water soon'),
-  ('cold',      'In trouble|Too cold|Just right|Just right|Getting dry|It''s far too cold — move somewhere warmer now'),
-  ('dark-tz',   'In trouble|Just right|Just right|Too dark|Just right|Far too dark — move closer to a window'),
-  ('sun',       'Needs attention|Just right|Just right|Too bright|Just right|Getting direct sun — move out of the sun'),
-  ('humid-12h', 'Needs attention|Just right|Too humid|Just right|Just right|The air has been very humid for 12 hours — improve airflow'),
-  ('soggy',     'Needs attention|Just right|Just right|Just right|Too wet|Soil has been soggy for 2 days — hold off watering'),
-  ('override',  'Needs attention|A bit cold|Just right|Just right|Just right|It''s a bit cold — keep away from drafts'),
-  ('lwt',       'Offline|Just right|Just right|Just right|Just right|No recent readings — check the sensor''s power and Wi-Fi'),
+  ('uncal',     'Feeling great|Just right|Just right|Just right|Not calibrated|All good: calibrate the soil sensor to track watering'),
+  ('soil-low',  'Needs attention|Just right|Just right|Just right|Getting dry|Soil is getting dry: water soon'),
+  ('cold',      'In trouble|Too cold|Just right|Just right|Getting dry|It''s far too cold: move somewhere warmer now'),
+  ('dark-tz',   'In trouble|Just right|Just right|Too dark|Just right|Far too dark: move closer to a window'),
+  ('sun',       'Needs attention|Just right|Just right|Too bright|Just right|Getting direct sun: move out of the sun'),
+  ('humid-12h', 'Needs attention|Just right|Too humid|Just right|Just right|The air has been very humid for 12 hours: improve airflow'),
+  ('soggy',     'Needs attention|Just right|Just right|Just right|Too wet|Soil has been soggy for 2 days: hold off watering'),
+  ('override',  'Needs attention|A bit cold|Just right|Just right|Just right|It''s a bit cold: keep away from drafts'),
+  ('lwt',       'Offline|Just right|Just right|Just right|Just right|No recent readings: check the sensor''s power and Wi-Fi'),
   ('nodata',    'No data yet|No data|No data|No data|No data|Waiting for the first reading'),
-  ('hum-crit',  'In trouble|Just right|Too humid|No data|Just right|The air is far too humid — improve airflow now'),
-  ('soil-crit', 'In trouble|Just right|Just right|No data|Too wet|Soil is waterlogged — stop watering and let it drain');
+  ('hum-crit',  'In trouble|Just right|Too humid|No data|Just right|The air is far too humid: improve airflow now'),
+  ('soil-crit', 'In trouble|Just right|Just right|No data|Too wet|Soil is waterlogged: stop watering and let it drain');
 grant select on expected_text to authenticated;
 
 select is(concat_ws('|', s.overall_label, s.temperature_label, s.humidity_label, s.light_label, s.soil_label, s.summary),

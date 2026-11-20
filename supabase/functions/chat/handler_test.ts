@@ -160,10 +160,23 @@ Deno.test("success: stores both rows and returns the plant reply", async () => {
     assertEquals(body.model, "claude-sonnet-5-5");
     assertEquals(body.thinking, { type: "adaptive" });
     assertStringIncludes(body.system, "You are Lily, a peace lily");
+    assertStringIncludes(body.system, "Never use em dashes");
+    assert(!body.system.includes("\u2014"), "the prompt itself contains no em dash");
     assertStringIncludes(body.system, "same language as the person's latest message");
     assertStringIncludes(body.system, "LOCAL TIME:");
     assert(body.messages.every((m) => m.role === "user" || m.role === "assistant"), "no system turns in messages");
     assertEquals(body.messages, [{ role: "user", content: "How are you?" }]);
+  });
+});
+
+Deno.test("success: em dashes in the model's reply are replaced before storing", async () => {
+  await withStub(async (s) => {
+    s.replies.push(answer("A little thirsty \u2014 water me soon. Mid\u2014day sun is too much."));
+    const { store, post } = setup(s.url);
+    const res = await post({ plant_id: PLANT, message: "How are you?" });
+    const { reply } = await res.json();
+    assertEquals(reply.content, "A little thirsty, water me soon. Mid-day sun is too much.");
+    assertEquals(store.rows[1].content, reply.content);
   });
 });
 

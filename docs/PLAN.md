@@ -525,7 +525,8 @@ class SupabaseWriter:
   - Subscriptions at QoS 1: `olvar/v1/+/telemetry` and `olvar/v1/+/status`.
   - Status messages update `devices.status`, `status_changed_at` and `last_seen_at`.
 - **Heartbeat:**
-  - Every 5 min it upserts `gateways(id, version, buffer_depth, last_seen_at)`.
+  - Every 5 min it upserts `gateways(id, version, buffer_depth, last_seen_at)`; never `owner_id`, which
+    `tools/setup_plant.py` sets (claims `GATEWAY_ID` for the plant owner) so owner-only RLS shows the row.
   - This also keeps the Free project from pausing for inactivity [29].
 - **Logging:** JSON lines on stdout, captured by journald and capped at 50 MB [24].
 - **Shutdown:** on SIGTERM it stops MQTT, flushes for up to 10 s and closes SQLite.
@@ -897,6 +898,7 @@ grant execute on function public.chat_admit(uuid, uuid, text) to service_role;
 > For care questions, give concrete advice based on the CARE NOTES and THRESHOLDS. Never recommend chemicals or
 > fertilizer doses.
 > If soil is "unknown" because the probe is not calibrated, suggest the Soil calibration screen.
+> Never use em dashes (the long dash, U+2014). Use a comma, a colon or a full stop instead.
 > Stay in character, and politely steer off-topic requests back to plant care.
 
 The dynamic context block (status, measurements, summaries, local time) is added as a second system message, after

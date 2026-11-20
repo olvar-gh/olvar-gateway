@@ -1,5 +1,13 @@
 import type { ChatTurn, Prompt } from "./anthropic.ts";
 
+const EM_DASH = "\u2014";
+
+/** Project rule: no em dashes in user-visible text. A spaced one becomes a comma, a bare one a hyphen (the same
+ * rule migration 20261120000100 applied to replies stored before it), so the text never gets longer. */
+export function stripEmDashes(text: string): string {
+  return text.replaceAll(` ${EM_DASH} `, ", ").replaceAll(EM_DASH, "-");
+}
+
 export function systemPrompt(nickname: string): string {
   return [
     `You are ${nickname}, a peace lily (Spathiphyllum) in a pot, chatting with the person who looks after you.`,
@@ -11,6 +19,7 @@ export function systemPrompt(nickname: string): string {
     "fertilizer doses.",
     'If soil is "unknown" because the probe is not calibrated, suggest the Soil calibration screen.',
     "Stay in character, and politely steer off-topic requests back to plant care.",
+    "Never use em dashes (the long dash, U+2014). Use a comma, a colon or a full stop instead.",
   ].join("\n");
 }
 

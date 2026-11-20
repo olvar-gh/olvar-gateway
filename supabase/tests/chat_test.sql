@@ -4,7 +4,7 @@ begin;
 create extension if not exists pgtap with schema extensions;
 create extension if not exists dblink with schema extensions;
 set local timezone = 'UTC';
-select plan(35);
+select plan(37);
 
 insert into auth.users (instance_id, id, aud, role, email) values
   ('00000000-0000-0000-0000-000000000000', '11111111-1111-4111-8111-111111111111', 'authenticated', 'authenticated', 'a@test.local'),
@@ -15,6 +15,30 @@ insert into public.plants (id, owner_id, profile_id) values
   ('c0000000-0000-4000-8000-000000000002', '11111111-1111-4111-8111-111111111111', 'spathiphyllum'),
   ('c0000000-0000-4000-8000-000000000003', '11111111-1111-4111-8111-111111111111', 'spathiphyllum'),
   ('c0000000-0000-4000-8000-000000000009', '22222222-2222-4222-8222-222222222222', 'spathiphyllum');
+
+-- ---------------------------------------------------------------------------------------------------------------
+-- 20261120000100: plant replies stored before it lose their em dashes; user messages are left as written
+-- ---------------------------------------------------------------------------------------------------------------
+with q as (
+  insert into public.chat_messages (plant_id, role, content)
+  values ('c0000000-0000-4000-8000-000000000003', 'user', U&'Hi \2014 thirsty?') returning id)
+insert into public.chat_messages (plant_id, role, content, reply_to)
+select 'c0000000-0000-4000-8000-000000000003', 'plant', U&'A little \2014 water me soon. Mid\2014day sun is too much.', q.id
+from q;
+select lives_ok($$
+  do $do$
+  declare s text;
+  begin
+    for s in select unnest(statements) from supabase_migrations.schema_migrations where version = '20261120000100'
+    loop
+      execute s;
+    end loop;
+  end $do$ $$, 're-applying the em dash migration succeeds');
+select results_eq(
+  $$select role, content from public.chat_messages where plant_id = 'c0000000-0000-4000-8000-000000000003' order by id$$,
+  $$values ('user'::text, U&'Hi \2014 thirsty?'::text), ('plant', 'A little, water me soon. Mid-day sun is too much.')$$,
+  'stored plant replies have their em dashes replaced, user messages are untouched');
+delete from public.chat_messages where plant_id = 'c0000000-0000-4000-8000-000000000003';
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Shape, grants, publication

@@ -2,7 +2,7 @@
 -- depend on seed.sql (except that the profile must exist after migrations alone).
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(80);
+select plan(82);
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Fixtures (as postgres): owner A with a plant, an uncalibrated device, a gateway and readings; user B with nothing.
@@ -116,6 +116,25 @@ select results_eq(
   $$select soil_pct from public.readings_v where device_id = 'test-dev-a' order by seq$$,
   $$values (100::real), (50::real), (25::real), (0::real), (0::real), (null::real)$$,
   'recalibration re-expresses past readings');
+
+-- Gateway owner (as service_role, like the Pi): the heartbeat upsert names only its own columns, so it neither
+-- changes nor clears owner_id; setup_plant.py's claim (id, owner_id) sets it and keeps the heartbeat columns.
+set local role service_role;
+insert into public.gateways (id, version, buffer_depth, last_seen_at) values ('test-gw-a', '0.2.0', 3, now())
+on conflict (id) do update set version = excluded.version, buffer_depth = excluded.buffer_depth,
+  last_seen_at = excluded.last_seen_at;
+select is((select owner_id from public.gateways where id = 'test-gw-a'), '11111111-1111-4111-8111-111111111111'::uuid,
+          'gateway heartbeat upsert keeps the owner');
+insert into public.gateways (id, version, buffer_depth, last_seen_at) values ('test-gw-new', '0.2.0', 0, now())
+on conflict (id) do update set version = excluded.version, buffer_depth = excluded.buffer_depth,
+  last_seen_at = excluded.last_seen_at;
+insert into public.gateways (id, owner_id) values ('test-gw-new', '22222222-2222-4222-8222-222222222222')
+on conflict (id) do update set owner_id = excluded.owner_id;
+select results_eq($$select owner_id, version, buffer_depth from public.gateways where id = 'test-gw-new'$$,
+                  $$values ('22222222-2222-4222-8222-222222222222'::uuid, '0.2.0'::text, 0)$$,
+                  'claiming an unowned gateway sets the owner and keeps the heartbeat columns');
+delete from public.gateways where id = 'test-gw-new';
+reset role;
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- Owner A (authenticated)
