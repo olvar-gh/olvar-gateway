@@ -57,14 +57,14 @@ isOneToOne: true
                   ]
                 },"devices": {
                   Row: {
-                    "created_at": string,"fw": string | null,"id": string,"last_seen_at": string | null,"owner_id": string | null,"plant_id": string | null,"soil_calibrated_at": string | null,"soil_dry_raw": number | null,"soil_wet_raw": number | null,"status": string,"status_changed_at": string | null
+                    "climate_sensor": string | null,"created_at": string,"fw": string | null,"id": string,"last_seen_at": string | null,"owner_id": string | null,"plant_id": string | null,"soil_calibrated_at": string | null,"soil_dry_raw": number | null,"soil_wet_raw": number | null,"status": string,"status_changed_at": string | null
                   }
                   ComputedFields: never
                   Insert: {
-                    "created_at"?: string,"fw"?: string | null,"id": string,"last_seen_at"?: string | null,"owner_id"?: string | null,"plant_id"?: string | null,"soil_calibrated_at"?: string | null,"soil_dry_raw"?: number | null,"soil_wet_raw"?: number | null,"status"?: string,"status_changed_at"?: string | null
+                    "climate_sensor"?: string | null,"created_at"?: string,"fw"?: string | null,"id": string,"last_seen_at"?: string | null,"owner_id"?: string | null,"plant_id"?: string | null,"soil_calibrated_at"?: string | null,"soil_dry_raw"?: number | null,"soil_wet_raw"?: number | null,"status"?: string,"status_changed_at"?: string | null
                   }
                   Update: {
-                    "created_at"?: string,"fw"?: string | null,"id"?: string,"last_seen_at"?: string | null,"owner_id"?: string | null,"plant_id"?: string | null,"soil_calibrated_at"?: string | null,"soil_dry_raw"?: number | null,"soil_wet_raw"?: number | null,"status"?: string,"status_changed_at"?: string | null
+                    "climate_sensor"?: string | null,"created_at"?: string,"fw"?: string | null,"id"?: string,"last_seen_at"?: string | null,"owner_id"?: string | null,"plant_id"?: string | null,"soil_calibrated_at"?: string | null,"soil_dry_raw"?: number | null,"soil_wet_raw"?: number | null,"status"?: string,"status_changed_at"?: string | null
                   }
                   Relationships: [
                     {

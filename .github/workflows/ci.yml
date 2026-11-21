@@ -12,7 +12,7 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# CI never deploys: production deploys are the manual `--remote` steps in docs/PLAN.md §7.
+# CI never deploys: production deploys are the manual `--remote` steps in docs/DEPLOY.md.
 jobs:
   gateway:
     name: Gateway (ruff + pytest)
@@ -56,3 +56,17 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno test --allow-net=127.0.0.1 supabase/functions/chat
+
+  repo:
+    name: Repo (shellcheck + no em dashes)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # shellcheck is preinstalled on the runner image. The container test (deploy/test/verify.sh) stays manual.
+      - run: shellcheck --version && shellcheck deploy/*.sh deploy/test/*.sh
+      - name: No em dashes (U+2014) in tracked files
+        run: |
+          if git ls-files -z | xargs -0 grep -nI $'\xe2\x80\x94'; then
+            echo "::error::Em dash (U+2014) found; use a colon, comma or hyphen instead"
+            exit 1
+          fi

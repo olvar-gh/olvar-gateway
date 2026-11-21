@@ -134,6 +134,7 @@ class FakePostgrest:
         self.clock: FakeTime | None = None
         self.delay_s = 0.0
         self.advance_s = 0.0
+        self.error_body: dict[str, str] = {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -143,7 +144,7 @@ class FakePostgrest:
         if self.clock and self.advance_s:
             self.clock.now += self.advance_s
         if self.status >= 300 or path in self.down_paths:
-            return httpx.Response(self.status if self.status >= 300 else 503, json={})
+            return httpx.Response(self.status if self.status >= 300 else 503, json=self.error_body)
         body = json.loads(request.content)
         if self.devices is not None:
             if path == "/rest/v1/devices":
@@ -235,7 +236,13 @@ def test_telemetry_reaches_readings_and_device(make_service, server):
     assert readings[0]["recorded_at"] == T0.isoformat()
     assert readings[0]["clock_source"] == "ntp"
     [device] = server.bodies("/rest/v1/devices")
-    assert device == {"id": DEVICE, "fw": "0.1.0", "last_seen_at": T0.isoformat()}
+    # No climate_sensor key in the message (older firmware): the column is cleared.
+    assert device == {
+        "id": DEVICE,
+        "fw": "0.1.0",
+        "last_seen_at": T0.isoformat(),
+        "climate_sensor": None,
+    }
     assert service._outbox.depth() == 0
     assert service.counters["accepted"] == 1
 
@@ -254,7 +261,9 @@ def test_unsynced_clock_holds_rows_and_sends_no_last_seen(make_service, server, 
     service.handle_message(TOPIC, telemetry(1))
     service.tick()
     assert server.bodies("/rest/v1/readings") == []
-    assert server.bodies("/rest/v1/devices") == [{"id": DEVICE, "fw": "0.1.0"}]
+    assert server.bodies("/rest/v1/devices") == [
+        {"id": DEVICE, "fw": "0.1.0", "climate_sensor": None}
+    ]
     assert service._outbox.depth() == 1
 
 
@@ -349,7 +358,12 @@ def test_last_seen_never_moves_backwards_when_coalescing(make_service, server, w
     service._flush_devices()
     seen = [b for b in server.bodies("/rest/v1/devices") if "last_seen_at" in b]
     assert seen == [
-        {"id": DEVICE, "fw": "0.1.0", "last_seen_at": (T0 + timedelta(minutes=5)).isoformat()}
+        {
+            "id": DEVICE,
+            "fw": "0.1.0",
+            "last_seen_at": (T0 + timedelta(minutes=5)).isoformat(),
+            "climate_sensor": None,
+        }
     ]
 
 
@@ -386,8 +400,73 @@ def test_device_update_is_retried_after_failure(make_service, server, fake_time)
     service.tick()
     assert server.bodies("/rest/v1/devices") == [
         {"id": DEVICE, "status": "offline", "status_changed_at": T0.isoformat()},
-        {"id": DEVICE, "fw": "0.1.0", "last_seen_at": T0.isoformat()},
+        {"id": DEVICE, "fw": "0.1.0", "last_seen_at": T0.isoformat(), "climate_sensor": None},
     ]
+
+
+@pytest.mark.parametrize(
+    ("value", "stored"),
+    [("sht31", "sht31"), ("dht11", "dht11"), ("DHT11", "dht11"), ("bme280", None), (None, None)],
+)
+def test_climate_sensor_reaches_device(make_service, server, value, stored):
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1, climate_sensor=value))
+    service.tick()
+    assert service.counters["accepted"] == 1
+    [device] = server.bodies("/rest/v1/devices")
+    assert device["climate_sensor"] == stored
+
+
+def test_latest_climate_sensor_wins_when_coalescing(make_service, server):
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1, climate_sensor="sht31"))
+    service.handle_message(TOPIC, telemetry(2))  # sensor lost: the next message omits the key
+    service._flush_devices()
+    [device] = server.bodies("/rest/v1/devices")
+    assert device["climate_sensor"] is None
+
+    service.handle_message(TOPIC, telemetry(3))
+    service.handle_message(TOPIC, telemetry(4, climate_sensor="dht11"))
+    service._flush_devices()
+    assert server.bodies("/rest/v1/devices")[-1]["climate_sensor"] == "dht11"
+
+
+def test_missing_column_is_retried_and_logged_once(make_service, server, fake_time, caplog):
+    # The Pi was updated before the migration that adds devices.climate_sensor was pushed.
+    service = make_service()
+    server.status = 400
+    server.error_body = {
+        "code": "PGRST204",
+        "message": "Could not find the 'climate_sensor' column",
+    }
+    with caplog.at_level(logging.INFO, logger="olvar_gateway.service"):
+        service.handle_message(TOPIC, telemetry(1, climate_sensor="sht31"))
+        service._flush_devices()
+        service._flush_devices()
+        failures = [r for r in caplog.records if "update failed, will retry" in r.getMessage()]
+        assert len(failures) == 1
+        assert "PGRST204" in failures[0].getMessage()
+        server.status = 201
+        service._flush_devices()
+    assert "device updates recovered" in caplog.text
+    assert server.bodies("/rest/v1/devices")[-1]["climate_sensor"] == "sht31"
+
+
+def test_status_message_leaves_climate_sensor_alone(make_service, server):
+    service = make_service()
+    service.handle_message(STATUS_TOPIC, b"online")
+    service.tick()
+    assert all("climate_sensor" not in b for b in server.bodies("/rest/v1/devices"))
+
+
+def test_climate_sensor_is_retried_with_the_device_update(make_service, server, fake_time):
+    service = make_service()
+    service.handle_message(TOPIC, telemetry(1, climate_sensor="sht31"))
+    server.status = 503
+    fake_time.now += service.tick()
+    server.status = 201
+    service.tick()
+    assert server.bodies("/rest/v1/devices")[-1]["climate_sensor"] == "sht31"
 
 
 def test_heartbeat_every_five_minutes(make_service, server, fake_time):

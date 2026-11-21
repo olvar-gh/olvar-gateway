@@ -30,6 +30,7 @@ BASE = {
     "lux": 1520.0,
     "soil_raw": 2214,
     "rssi_dbm": -61,
+    "climate_sensor": "sht31",
     "fw": "0.1.0",
 }
 
@@ -89,6 +90,36 @@ def test_parse_full_example():
 
 def test_rssi_is_optional():
     assert parse_message(TOPIC, payload(rssi_dbm=...)).rssi_dbm is None
+
+
+def test_climate_sensor_is_optional():
+    assert parse_message(TOPIC, payload(climate_sensor=...)).climate_sensor is None
+    assert "climate_sensor" not in SCHEMA["required"]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("sht31", "sht31"),
+        ("dht11", "dht11"),
+        ("SHT31", "sht31"),
+        (" dht11 ", "dht11"),
+        ("bme280", None),
+        ("", None),
+        (None, None),
+        (31, None),
+        (True, None),
+        (["sht31"], None),
+        ({"name": "sht31"}, None),
+    ],
+)
+def test_climate_sensor_unknown_values_are_absent_not_rejected(value, expected):
+    t = parse_message(TOPIC, payload(climate_sensor=value))
+    assert t.climate_sensor == expected
+    assert t.out_of_range == ()
+    assert t.model_dump(exclude={"climate_sensor"}) == {
+        k: v for k, v in BASE.items() if k != "climate_sensor"
+    }
 
 
 def test_null_sensors_accepted():

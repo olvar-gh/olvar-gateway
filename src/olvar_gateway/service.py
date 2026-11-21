@@ -52,6 +52,8 @@ HTTP_TIMEOUT_S: Final = 15.0
 STATUSES: Final = frozenset({"online", "offline"})
 _TOPIC_RE: Final = re.compile(r"olvar/v1/([^/]+)/(telemetry|status)")
 _DEVICE_ID_RE: Final = re.compile(DEVICE_ID_PATTERN)
+# Device fields where None is a value to store, not "nothing to send".
+_NULLABLE_FIELDS: Final = frozenset({"status_changed_at", "climate_sensor"})
 
 
 class Intake(Protocol):
@@ -84,6 +86,8 @@ def _merge(older: dict[str, Any], newer: dict[str, Any]) -> dict[str, Any]:
         merged["status_changed_at"] = newer["status_changed_at"]
     if "fw" in newer:
         merged["fw"] = newer["fw"]
+    if "climate_sensor" in newer:
+        merged["climate_sensor"] = newer["climate_sensor"]
     if "last_seen_at" in newer:
         merged["last_seen_at"] = max(
             newer["last_seen_at"], older.get("last_seen_at", newer["last_seen_at"])
@@ -152,6 +156,7 @@ class Service:
         self._uploader = Uploader(outbox, self._readings, clock, **uploader_options)
         self._rng = rng or random.random
         self._device_failures = 0
+        self._device_error: str | None = None
         self._heartbeat_s = heartbeat_s
         self._mono = monotonic
         self._sleep = sleep
@@ -203,7 +208,12 @@ class Service:
             self.counters["accepted"] += 1
         else:
             self.counters["duplicate"] += 1
-        self._touch(device_id, fw=telemetry.fw, last_seen_at=row.recorded_at)
+        self._touch(
+            device_id,
+            fw=telemetry.fw,
+            last_seen_at=row.recorded_at,
+            climate_sensor=telemetry.climate_sensor,  # None clears it: the latest message wins
+        )
         self._wake.set()
 
     def _status(self, device_id: str, payload: bytes) -> None:
@@ -227,7 +237,7 @@ class Service:
         self._wake.set()
 
     def _touch(self, device_id: str, **fields: Any) -> None:
-        fields = {k: v for k, v in fields.items() if v is not None or k == "status_changed_at"}
+        fields = {k: v for k, v in fields.items() if v is not None or k in _NULLABLE_FIELDS}
         with self._pending_lock:
             self._pending[device_id] = _merge(self._pending.get(device_id, {}), fields)
 
@@ -313,7 +323,7 @@ class Service:
                     ),
                 )
             )
-        seen = {k: fields[k] for k in ("fw", "last_seen_at") if k in fields}
+        seen = {k: fields[k] for k in ("fw", "last_seen_at", "climate_sensor") if k in fields}
         if seen:
             parts.append((seen, lambda: self._writer.upsert_device(device_id, **seen)))
         unsent: dict[str, Any] = {}
@@ -326,8 +336,18 @@ class Service:
             if result.outcome == "retryable":
                 unsent.update(part)
                 failed = True
+                # Once per kind of failure, like the uploader: a PGRST204 here usually means the Pi
+                # runs a release whose migration was not pushed yet.
+                if result.error_class != self._device_error:
+                    log.error(
+                        "device %s update failed, will retry: %s", device_id, result.describe()
+                    )
+                    self._device_error = result.error_class
             elif result.ok:
                 self._readings.confirm(device_id)
+                if self._device_error is not None:
+                    log.info("device updates recovered")
+                    self._device_error = None
             else:
                 log.error("device %s update rejected: %s", device_id, result.describe())
         return unsent, failed

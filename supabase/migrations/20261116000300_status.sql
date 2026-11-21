@@ -1,5 +1,7 @@
 -- Derived plant status (docs/PLAN.md §5.6, decision D8) and Timeline offline periods (decision D14).
 -- Everything here is security invoker: callers see only the plants, devices and readings that RLS lets them see.
+-- The summary texts below are superseded by 20261120000100_no_em_dashes.sql. Their em dashes are spelled U&'\2014'
+-- (2026-11-20) so the repo holds no U+2014 character; the strings, and so this applied migration, are unchanged.
 
 -- ---------------------------------------------------------------------------------------------------------------
 -- effective_thresholds(plant_id): profile thresholds deep-merged per metric with plants.threshold_overrides.
@@ -187,31 +189,31 @@ select o.plant_id, o.device_id, o.latest_reading_at, o.device_status, coalesce(o
          when 'offline' then 'Offline' else 'No data yet' end as overall_label,
        case
          when o.overall = 'no_data' then 'Waiting for the first reading'
-         when o.overall = 'offline' then 'No recent readings — check the sensor''s power and Wi-Fi'
+         when o.overall = 'offline' then 'No recent readings ' || U&'\2014' || ' check the sensor''s power and Wi-Fi'
          when cardinality(o.issues) = 0 then
-           case when not coalesce(o.soil_calibrated, false) then 'All good — calibrate the soil sensor to track watering'
-                when o.overall = 'great' then 'All good — I''m feeling great'
+           case when not coalesce(o.soil_calibrated, false) then 'All good ' || U&'\2014' || ' calibrate the soil sensor to track watering'
+                when o.overall = 'great' then 'All good ' || U&'\2014' || ' I''m feeling great'
                 else 'Everything is within range' end
          else case o.issues[1] || ':' || case o.issues[1] when 'soil' then o.soil_status
                                                           when 'temperature' then o.temperature_status
                                                           when 'humidity' then o.humidity_status
                                                           else o.light_status end
-           when 'soil:critical_low' then 'Soil is very dry — water now'
-           when 'soil:low' then 'Soil is getting dry — water soon'
-           when 'soil:high' then 'Soil has been soggy for 2 days — hold off watering'
-           when 'soil:critical_high' then 'Soil is waterlogged — stop watering and let it drain'
-           when 'temperature:critical_low' then 'It''s far too cold — move somewhere warmer now'
-           when 'temperature:low' then 'It''s a bit cold — keep away from drafts'
-           when 'temperature:high' then 'It''s a bit warm — move somewhere cooler'
-           when 'temperature:critical_high' then 'It''s far too hot — move out of the heat now'
-           when 'humidity:critical_low' then 'The air is very dry — mist the leaves or use a humidifier'
-           when 'humidity:low' then 'The air is a bit dry — leaf tips may brown'
-           when 'humidity:high' then 'The air has been very humid for 12 hours — improve airflow'
-           when 'humidity:critical_high' then 'The air is far too humid — improve airflow now'
-           when 'light:critical_low' then 'Far too dark — move closer to a window'
-           when 'light:low' then 'Could use more light — try a brighter spot'
-           when 'light:high' then 'Getting direct sun — move out of the sun'
-           when 'light:critical_high' then 'Strong direct sun — move now to avoid scorched leaves'
+           when 'soil:critical_low' then 'Soil is very dry ' || U&'\2014' || ' water now'
+           when 'soil:low' then 'Soil is getting dry ' || U&'\2014' || ' water soon'
+           when 'soil:high' then 'Soil has been soggy for 2 days ' || U&'\2014' || ' hold off watering'
+           when 'soil:critical_high' then 'Soil is waterlogged ' || U&'\2014' || ' stop watering and let it drain'
+           when 'temperature:critical_low' then 'It''s far too cold ' || U&'\2014' || ' move somewhere warmer now'
+           when 'temperature:low' then 'It''s a bit cold ' || U&'\2014' || ' keep away from drafts'
+           when 'temperature:high' then 'It''s a bit warm ' || U&'\2014' || ' move somewhere cooler'
+           when 'temperature:critical_high' then 'It''s far too hot ' || U&'\2014' || ' move out of the heat now'
+           when 'humidity:critical_low' then 'The air is very dry ' || U&'\2014' || ' mist the leaves or use a humidifier'
+           when 'humidity:low' then 'The air is a bit dry ' || U&'\2014' || ' leaf tips may brown'
+           when 'humidity:high' then 'The air has been very humid for 12 hours ' || U&'\2014' || ' improve airflow'
+           when 'humidity:critical_high' then 'The air is far too humid ' || U&'\2014' || ' improve airflow now'
+           when 'light:critical_low' then 'Far too dark ' || U&'\2014' || ' move closer to a window'
+           when 'light:low' then 'Could use more light ' || U&'\2014' || ' try a brighter spot'
+           when 'light:high' then 'Getting direct sun ' || U&'\2014' || ' move out of the sun'
+           when 'light:critical_high' then 'Strong direct sun ' || U&'\2014' || ' move now to avoid scorched leaves'
            end
          end as summary,
        o.computed_at

@@ -15,7 +15,7 @@ timedatectl | grep synchronized
 | What you see | Meaning | What to do |
 |---|---|---|
 | `queue_depth` grows, `last_error` mentions 401/403/`42501` | the secret key was deleted or rotated | create a new `gateway` key (DEPLOY.md A3), put it in `gateway.env`, restart |
-| `last_error` mentions 404 or `PGRST` | migrations missing on the project | `supabase db push --remote` on your computer (DEPLOY.md A5) |
+| `last_error` mentions 404 or `PGRST`, or the log shows `device … update failed, will retry: schema 400 PGRST204` | migrations missing on the project (for example the Pi was updated before `db push`) | `supabase db push --remote` on your computer, at the same tag as the Pi (DEPLOY.md "Updating later") |
 | `heartbeat failed: network …` | no internet or the Supabase project is paused | check the Pi's network; in the dashboard, **Restore project** if it is paused (Free projects pause after 7 days without activity) |
 | `dead_letters` above 0 | some readings were rejected by the database | `journalctl -u olvar-gateway | grep dead` shows why; they are kept in the outbox file, not uploaded |
 | `System clock synchronized: no` | no NTP yet | readings are held and stamped once the clock syncs; check the network |
@@ -37,12 +37,15 @@ Logs are capped at 50 MB in total.
 
 ## Update to a new release
 
+Push the release's migrations to Supabase **first** (on your computer), then update the Pi:
+
 ```sh
 cd ~/olvar-gateway
 sudo deploy/update.sh <tag>
 ```
 
-See "Updating later" in DEPLOY.md for the Supabase side.
+The full order, and the one-time move from `main` to the first tag `v0.1.0`, are in "Updating later" in
+DEPLOY.md.
 
 ## Change an MQTT password
 
